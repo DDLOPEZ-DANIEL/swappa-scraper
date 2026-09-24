@@ -13,21 +13,22 @@ SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "mi_clave1_secreta_swappa_2026")
 # MARGEN DE GANANCIA: 30% (Precio Base * 1.30)
 MARGEN_GANANCIA = 1.30
 
-# URLs directas según la estructura observada en Swappa
+# URLs exactas basadas en la navegación real de Swappa
 TARGET_URLS = [
-    # --- CELULARES DESBLOQUEADOS (Para Nicaragua) ---
-    {"categoria": "Celular", "url": "https://swappa.com/buy/unlocked"},
-    {"categoria": "Celular", "url": "https://swappa.com/buy/unlocked/apple"},
-    {"categoria": "Celular", "url": "https://swappa.com/buy/unlocked/samsung"},
-    # --- LAPTOPS ---
-    {"categoria": "Laptop", "url": "https://swappa.com/laptops/macbooks"},
-    {"categoria": "Laptop", "url": "https://swappa.com/laptops/dell"},
-    {"categoria": "Laptop", "url": "https://swappa.com/laptops/hp"},
-    {"categoria": "Laptop", "url": "https://swappa.com/laptops/lenovo"}
+    # --- CELULARES DESBLOQUEADOS (Nicaragua) ---
+    {"categoria": "Celular", "brand": "Apple", "url": "https://swappa.com/buy/unlocked/apple"},
+    {"categoria": "Celular", "brand": "Samsung", "url": "https://swappa.com/buy/unlocked/samsung"},
+    {"categoria": "Celular", "brand": "Google", "url": "https://swappa.com/buy/unlocked/google"},
+    # --- LAPTOPS POR MARCA ---
+    {"categoria": "Laptop", "brand": "Apple", "url": "https://swappa.com/buy/b/apple"},
+    {"categoria": "Laptop", "brand": "Dell", "url": "https://swappa.com/buy/b/dell"},
+    {"categoria": "Laptop", "brand": "HP", "url": "https://swappa.com/buy/b/hp"},
+    {"categoria": "Laptop", "brand": "Lenovo", "url": "https://swappa.com/buy/b/lenovo"},
+    {"categoria": "Laptop", "brand": "Asus", "url": "https://swappa.com/buy/b/asus"}
 ]
 
 async def extraer_y_enviar():
-    print("Iniciando extracción en Swappa (Celulares Desbloqueados y Laptops)...")
+    print("Iniciando extracción en Swappa...")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -48,29 +49,33 @@ async def extraer_y_enviar():
 
         for target in TARGET_URLS:
             categoria = target["categoria"]
+            brand = target["brand"]
             target_url = target["url"]
             
             try:
-                print(f"\n--- Escaneando {categoria}s en: {target_url} ---")
+                print(f"\n--- Escaneando {categoria}s ({brand}) en: {target_url} ---")
                 response = await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-                print(f"Estado HTTP: {response.status if response else 'Sin respuesta'}")
+                
+                if not response or response.status != 200:
+                    print(f"Omitiendo por respuesta HTTP {response.status if response else 'Nula'}")
+                    continue
 
-                await asyncio.sleep(4)
+                await asyncio.sleep(3)
 
-                # Buscar tarjetas de producto en el catálogo (bloques de productos)
-                cards = await page.query_selector_all("a[href*='/listing/'], a[href*='/buy/']")
-                print(f"Elementos encontrados en página: {len(cards)}")
+                # Seleccionar todas las tarjetas/bloques de catálogo que contienen un enlace /buy/
+                cards = await page.query_selector_all("a[href*='/buy/']")
+                print(f"Tarjetas de catálogo encontradas: {len(cards)}")
 
                 procesados = 0
                 for index, item in enumerate(cards):
-                    if procesados >= 10:  # Máximo 10 productos por sección
+                    if procesados >= 10:  # Límite de 10 productos por sección
                         break
 
                     try:
                         href = await item.get_attribute("href") or ""
                         
-                        # Filtrar solo enlaces de producto/listado
-                        if not href or href == target_url or href.endswith("/buy") or href.endswith("/laptops"):
+                        # Filtrar la URL base o enlaces repetidos del menú superior
+                        if not href or href == target_url or href.count('/') < 3:
                             continue
 
                         source_url = "https://swappa.com" + href if href.startswith("/") else href
@@ -81,45 +86,34 @@ async def extraer_y_enviar():
                         if not lines:
                             continue
 
-                        # Extraer título
                         title_text = lines[0]
-                        
+                        if title_text.lower() in ["ver más", "view more", "filtrar", "filter", "todos"]:
+                            continue
+
                         # Extraer el precio en USD
                         cost_price = 0.0
                         for line in lines:
                             if "$" in line:
                                 cleaned = "".join(c for c in line if c.isdigit() or c == '.')
                                 if cleaned:
-                                    cost_price = float(cleaned)
-                                    break
+                                    try:
+                                        cost_price = float(cleaned)
+                                        break
+                                    except ValueError:
+                                        continue
 
                         if cost_price <= 0:
                             continue
 
-                        # Calcular precio de venta con el 30% de ganancia
+                        # Precio de venta con margen del 30%
                         sale_price = round(cost_price * MARGEN_GANANCIA, 2)
 
-                        # Buscar la imagen del producto
+                        # Capturar la imagen
                         img_elem = await item.query_selector("img")
                         image_url = await img_elem.get_attribute("src") if img_elem else ""
 
-                        # Identificar marca
-                        title_lower = title_text.lower()
-                        if "iphone" in title_lower or "macbook" in title_lower or "apple" in title_lower:
-                            brand = "Apple"
-                        elif "samsung" in title_lower or "galaxy" in title_lower:
-                            brand = "Samsung"
-                        elif "dell" in title_lower:
-                            brand = "Dell"
-                        elif "hp" in title_lower:
-                            brand = "HP"
-                        elif "lenovo" in title_lower:
-                            brand = "Lenovo"
-                        else:
-                            brand = "Genérico"
-
                         producto = {
-                            "title": title_text,
+                            "title": f"{brand} {title_text}" if brand not in title_text else title_text,
                             "brand": brand,
                             "model": title_text,
                             "condition": "Good",
@@ -136,17 +130,17 @@ async def extraer_y_enviar():
                         }
                         
                         res = requests.post(BASE44_WEBHOOK_URL, json=producto, headers=headers, timeout=10)
-                        print(f"  [{categoria} - {brand}] '{title_text}' | Costo: ${cost_price} -> Venta (30%): ${sale_price} | Base44 Status: {res.status_code}")
+                        print(f"  [{categoria} - {brand}] '{producto['title']}' | Costo: ${cost_price} -> Venta (30%): ${sale_price} | Base44 Status: {res.status_code}")
                         procesados += 1
 
                     except Exception as item_error:
                         print(f"  Error procesando elemento {index + 1}: {item_error}")
 
             except Exception as nav_error:
-                print(f"Error cargando la sección {target_url}: {nav_error}")
+                print(f"Error en sección {target_url}: {nav_error}")
 
         await browser.close()
-        print("\nProceso de extracción finalizado con éxito.")
+        print("\nExtracción completada exitosamente.")
 
 if __name__ == "__main__":
     asyncio.run(extraer_y_enviar())
