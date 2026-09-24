@@ -2,7 +2,6 @@ import asyncio
 import os
 import requests
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
 
 # CONFIGURACIÓN Y VARIABLES DE ENTORNO
 BASE44_WEBHOOK_URL = os.getenv(
@@ -21,26 +20,33 @@ async def extraer_y_enviar():
         # Lanzar navegador Chromium en modo headless
         browser = await p.chromium.launch(headless=True)
         
-        # Crear contexto simulando un usuario real
+        # Crear contexto con configuraciones anti-detección humanas nativas
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800}
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
+            timezone_id="America/New_York"
         )
-        page = await context.new_page()
         
-        # Aplicar protecciones stealth a la página directamente
-        await stealth_async(page)
+        page = await context.new_page()
+
+        # Script ligero de evasión de detección de automatización (webdriver flag)
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
 
         try:
             print("Navegando a la sección de laptops en Swappa...")
-            await page.goto("https://swappa.com/laptops", wait_until="networkidle", timeout=60000)
+            await page.goto("https://swappa.com/laptops", wait_until="domcontentloaded", timeout=60000)
 
-            # Esperar a que los elementos de productos estén visibles
-            await page.wait_for_selector(".listing_card", timeout=15000)
+            # Esperar a que los elementos de productos estén disponibles
+            await page.wait_for_selector(".listing_card", timeout=20000)
             items = await page.query_selector_all(".listing_card")
             print(f"Se encontraron {len(items)} productos.")
 
-            for index, item in enumerate(items[:15]):  # Procesa los primeros 15 productos
+            for index, item in enumerate(items[:15]):  # Procesar los primeros 15 productos
                 try:
                     title_elem = await item.query_selector(".title")
                     price_elem = await item.query_selector(".price")
@@ -61,7 +67,7 @@ async def extraer_y_enviar():
 
                     image_url = await img_elem.get_attribute("src") if img_elem else ""
 
-                    # Objeto JSON para Base44
+                    # Estructuración de datos para Base44
                     producto = {
                         "title": title_text.strip(),
                         "brand": "Genérico",
@@ -74,7 +80,7 @@ async def extraer_y_enviar():
                         "source_url": source_url
                     }
 
-                    # Enviar petición POST al Webhook de Base44
+                    # Petición POST al Webhook de Base44
                     headers = {
                         "Content-Type": "application/json",
                         "x-api-key": SCRAPER_API_KEY
