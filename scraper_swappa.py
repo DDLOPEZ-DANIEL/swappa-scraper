@@ -2,7 +2,7 @@ import asyncio
 import os
 import requests
 from playwright.async_api import async_playwright
-from playwright_stealth import Stealth
+from playwright_stealth import stealth_async
 
 # CONFIGURACIÓN Y VARIABLES DE ENTORNO
 BASE44_WEBHOOK_URL = os.getenv(
@@ -21,9 +21,6 @@ async def extraer_y_enviar():
         # Lanzar navegador Chromium en modo headless
         browser = await p.chromium.launch(headless=True)
         
-        # Instanciar el objeto Stealth v2 para evadir detecciones
-        stealth = Stealth()
-        
         # Crear contexto simulando un usuario real
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -31,8 +28,8 @@ async def extraer_y_enviar():
         )
         page = await context.new_page()
         
-        # Aplicar protecciones stealth a la página
-        await stealth.apply_to(page)
+        # Aplicar protecciones stealth a la página directamente
+        await stealth_async(page)
 
         try:
             print("Navegando a la sección de laptops en Swappa...")
