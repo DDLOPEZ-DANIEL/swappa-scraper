@@ -1,7 +1,7 @@
 import asyncio
 import requests
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+from playwright_stealth import stealth_page
 import os
 
 # CONFIGURACIÓN
@@ -17,7 +17,7 @@ async def extraer_y_enviar():
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
-        await stealth_async(page)
+        await stealth_page(page)
 
         print("Navegando a Swappa...")
         # Ejemplo: Categoria de Laptops o Celulares Unlocked
