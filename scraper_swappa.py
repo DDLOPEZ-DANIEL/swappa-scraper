@@ -86,24 +86,24 @@ async def extraer_y_enviar():
 
                 await asyncio.sleep(2)
 
-                # Seleccionar los elementos de enlace directo o tarjetas de productos
-                cards = await page.query_selector_all("a[href*='/buy/'], div.product-card, div.square")
-                print(f"Total de enlaces/tarjetas detectadas: {len(cards)}")
+                # Seleccionar los elementos de enlace directo
+                cards = await page.query_selector_all("a[href*='/buy/']")
+                print(f"Total de enlaces detectados: {len(cards)}")
 
                 for index, item in enumerate(cards):
                     try:
-                        # 1. Extraer href (OBLIGATORIO para Base44)
+                        # 1. Extraer href
                         href = await item.get_attribute("href") or ""
                         if not href:
                             link_elem = await item.query_selector("a")
                             if link_elem:
                                 href = await link_elem.get_attribute("href") or ""
 
-                        if not href or href == target_url or "/buy/unlocked" in href or "/buy/b/" in href:
-                            # Ignorar enlaces a la misma categoría o navegación general
-                            continue
-
                         source_url = "https://swappa.com" + href if href.startswith("/") else href
+
+                        # Omitir únicamente si coincide con la URL exacta del catálogo/categoría
+                        if not href or source_url.rstrip('/') == target_url.rstrip('/'):
+                            continue
 
                         # 2. Leer texto interno
                         text_content = await item.inner_text()
@@ -140,7 +140,7 @@ async def extraer_y_enviar():
 
                         # 4. Extraer título y modelo
                         title_text = lines[0]
-                        if any(bad in title_text.lower() for bad in ["ver más", "view more", "filter", "todos", "vender", "swappa", "sell"]):
+                        if any(bad in title_text.lower() for bad in ["ver más", "view more", "filter", "todos", "vender", "swappa", "sell", "browse"]):
                             continue
 
                         sale_price = round(cost_price * MARGEN_GANANCIA, 2)
@@ -170,13 +170,13 @@ async def extraer_y_enviar():
                             "title": nombre_completo,
                             "brand": brand,
                             "model": title_text,
-                            "condition": "Good",  # Valida contra ALLOWED_CONDITIONS: ['Mint', 'Good', 'Fair']
+                            "condition": "Good",
                             "cost_price": cost_price,
                             "sale_price": sale_price,
                             "storage": storage,
                             "image_url": image_url,
                             "source_url": source_url,
-                            "status": "Draft"      # Guardar como Borrador en Base44
+                            "status": "Draft"
                         }
 
                         headers = {
@@ -187,7 +187,8 @@ async def extraer_y_enviar():
                         res = requests.post(BASE44_WEBHOOK_URL, json=producto, headers=headers, timeout=10)
                         
                         total_enviados += 1
-                        print(f"[{total_enviados}] [{categoria} - {brand}] {nombre_completo} | Costo: ${cost_price} -> Venta: ${sale_price} | Base44 Status: {res.status_code} ({res.json().get('action', 'response')})")
+                        action_resp = res.json().get('action', 'ok') if res.status_code == 200 else res.text
+                        print(f"[{total_enviados}] [{categoria} - {brand}] {nombre_completo} | Costo: ${cost_price} -> Venta: ${sale_price} | Base44 Status: {res.status_code} ({action_resp})")
 
                     except Exception as item_error:
                         continue
