@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import requests
 from playwright.async_api import async_playwright
 
@@ -8,13 +9,11 @@ BASE44_WEBHOOK_URL = os.getenv(
     "BASE44_WEBHOOK_URL", 
     "https://rebit-smart-grid.base44.app/functions/swappaWebhook"
 )
-# Debe coincidir exactamente con el secreto 'SCRAPER_API_KEY' en el panel de Base44
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "mi_clave1_secreta_swappa_2026")
 
 # MARGEN DE GANANCIA: 30% (Precio Base * 1.30)
 MARGEN_GANANCIA = 1.30
 
-# URLs exactas de Swappa
 TARGET_URLS = [
     # --- CELULARES DESBLOQUEADOS ---
     {"categoria": "Celular", "brand": "Apple", "url": "https://swappa.com/buy/unlocked/apple"},
@@ -67,7 +66,7 @@ async def extraer_y_enviar():
 
                 await asyncio.sleep(3)
 
-                # Scroll progresivo para cargar imágenes perezosas (lazy loading)
+                # Scroll progresivo
                 await page.evaluate("""async () => {
                     await new Promise((resolve) => {
                         let totalHeight = 0;
@@ -92,60 +91,46 @@ async def extraer_y_enviar():
 
                 for index, item in enumerate(cards):
                     try:
-                        # 1. Extraer href
                         href = await item.get_attribute("href") or ""
-                        if not href:
-                            link_elem = await item.query_selector("a")
-                            if link_elem:
-                                href = await link_elem.get_attribute("href") or ""
-
                         source_url = "https://swappa.com" + href if href.startswith("/") else href
 
-                        # Omitir únicamente si coincide con la URL exacta del catálogo/categoría
+                        # Omitir la misma URL del catálogo
                         if not href or source_url.rstrip('/') == target_url.rstrip('/'):
                             continue
 
-                        # 2. Leer texto interno
                         text_content = await item.inner_text()
-                        lines = [line.strip() for line in text_content.split("\n") if line.strip()]
-                        
-                        if len(lines) < 2:
+                        if not text_content:
                             continue
 
-                        # 3. Extraer y validar precio ($)
+                        lines = [line.strip() for line in text_content.split("\n") if line.strip()]
+                        
+                        # Buscar precios en dólares con Regex (ejemplo: $250, $1,200.00, $99)
+                        prices_found = re.findall(r'\$\s*([0-9,]+(?:\.[0-9]{2})?)', text_content)
+                        
                         cost_price = 0.0
-                        for line in lines:
-                            if "$" in line:
-                                parts = line.split("$")
-                                for part in parts[1:]:
-                                    val_str = ""
-                                    for char in part:
-                                        if char.isdigit() or char == '.':
-                                            val_str += char
-                                        else:
-                                            break
-                                    if val_str:
-                                        try:
-                                            parsed = float(val_str)
-                                            if parsed > 15: # Filtrar costos mínimos no representativos
-                                                cost_price = parsed
-                                                break
-                                        except ValueError:
-                                            continue
-                            if cost_price > 0:
-                                break
+                        if prices_found:
+                            for raw_p in prices_found:
+                                val = float(raw_p.replace(',', ''))
+                                if val >= 20: # Filtrar precios irrelevantes
+                                    cost_price = val
+                                    break
 
                         if cost_price <= 0:
                             continue
 
-                        # 4. Extraer título y modelo
-                        title_text = lines[0]
-                        if any(bad in title_text.lower() for bad in ["ver más", "view more", "filter", "todos", "vender", "swappa", "sell", "browse"]):
+                        # Obtener título (primera línea no vacía que no sea precio)
+                        title_text = ""
+                        for line in lines:
+                            if not line.startswith("$") and not any(bad in line.lower() for bad in ["from", "ver más", "view more", "filter", "swappa", "sell", "buy"]):
+                                title_text = line
+                                break
+
+                        if not title_text:
                             continue
 
                         sale_price = round(cost_price * MARGEN_GANANCIA, 2)
 
-                        # 5. Extraer imagen
+                        # Extraer imagen
                         img_elem = await item.query_selector("img")
                         image_url = ""
                         if img_elem:
@@ -156,7 +141,7 @@ async def extraer_y_enviar():
                             if image_url and image_url.startswith("//"):
                                 image_url = "https:" + image_url
 
-                        # 6. Extraer capacidad / almacenamiento
+                        # Extraer capacidad / almacenamiento
                         storage = "Nicaragua / Unlocked" if categoria == "Celular" else "Estándar"
                         for line in lines:
                             if any(unit in line.upper() for unit in ["GB", "TB"]):
@@ -165,7 +150,6 @@ async def extraer_y_enviar():
 
                         nombre_completo = f"{brand} {title_text}" if brand.lower() not in title_text.lower() else title_text
 
-                        # Estructura limpia ajustada al Webhook de Base44
                         producto = {
                             "title": nombre_completo,
                             "brand": brand,
