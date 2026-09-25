@@ -8,12 +8,13 @@ BASE44_WEBHOOK_URL = os.getenv(
     "BASE44_WEBHOOK_URL", 
     "https://rebit-smart-grid.base44.app/functions/swappaWebhook"
 )
+# Debe coincidir exactamente con el secreto 'SCRAPER_API_KEY' en el panel de Base44
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "mi_clave1_secreta_swappa_2026")
 
 # MARGEN DE GANANCIA: 30% (Precio Base * 1.30)
 MARGEN_GANANCIA = 1.30
 
-# URLs exactas de Celulares Desbloqueados y Laptops
+# URLs exactas de Swappa
 TARGET_URLS = [
     # --- CELULARES DESBLOQUEADOS ---
     {"categoria": "Celular", "brand": "Apple", "url": "https://swappa.com/buy/unlocked/apple"},
@@ -66,7 +67,7 @@ async def extraer_y_enviar():
 
                 await asyncio.sleep(3)
 
-                # Scroll progresivo para cargar imágenesLazy
+                # Scroll progresivo para cargar imágenes perezosas (lazy loading)
                 await page.evaluate("""async () => {
                     await new Promise((resolve) => {
                         let totalHeight = 0;
@@ -85,52 +86,66 @@ async def extraer_y_enviar():
 
                 await asyncio.sleep(2)
 
-                # Seleccionar todas las tarjetas dentro del área principal
-                cards = await page.query_selector_all("main a, div.product-card, a[href*='/buy/']")
-                print(f"Total de bloques detectados: {len(cards)}")
+                # Seleccionar los elementos de enlace directo o tarjetas de productos
+                cards = await page.query_selector_all("a[href*='/buy/'], div.product-card, div.square")
+                print(f"Total de enlaces/tarjetas detectadas: {len(cards)}")
 
                 for index, item in enumerate(cards):
                     try:
-                        text_content = await item.inner_text()
-                        lines = [line.strip() for line in text_content.split("\n") if line.strip()]
-                        
-                        # Debe tener al menos título y precio (2 o más líneas de texto)
-                        if len(lines) < 2:
-                            continue
-
-                        # Buscar precio en USD ($)
-                        cost_price = 0.0
-                        for line in lines:
-                            if "$" in line:
-                                cleaned = "".join(c for c in line if c.isdigit() or c == '.')
-                                if cleaned:
-                                    try:
-                                        cost_price = float(cleaned)
-                                        break
-                                    except ValueError:
-                                        continue
-
-                        # Si no hay precio, la tarjeta no es un producto individual
-                        if cost_price <= 0:
-                            continue
-
-                        title_text = lines[0]
-                        if title_text.lower() in ["ver más", "view more", "filtrar", "filter", "todos", "all", "vender", "swappa"]:
-                            continue
-
-                        # Obtener enlace
+                        # 1. Extraer href (OBLIGATORIO para Base44)
                         href = await item.get_attribute("href") or ""
                         if not href:
                             link_elem = await item.query_selector("a")
                             if link_elem:
                                 href = await link_elem.get_attribute("href") or ""
 
+                        if not href or href == target_url or "/buy/unlocked" in href or "/buy/b/" in href:
+                            # Ignorar enlaces a la misma categoría o navegación general
+                            continue
+
                         source_url = "https://swappa.com" + href if href.startswith("/") else href
 
-                        # Calcular precio de venta al público en Nicaragua (30% de ganancia)
+                        # 2. Leer texto interno
+                        text_content = await item.inner_text()
+                        lines = [line.strip() for line in text_content.split("\n") if line.strip()]
+                        
+                        if len(lines) < 2:
+                            continue
+
+                        # 3. Extraer y validar precio ($)
+                        cost_price = 0.0
+                        for line in lines:
+                            if "$" in line:
+                                parts = line.split("$")
+                                for part in parts[1:]:
+                                    val_str = ""
+                                    for char in part:
+                                        if char.isdigit() or char == '.':
+                                            val_str += char
+                                        else:
+                                            break
+                                    if val_str:
+                                        try:
+                                            parsed = float(val_str)
+                                            if parsed > 15: # Filtrar costos mínimos no representativos
+                                                cost_price = parsed
+                                                break
+                                        except ValueError:
+                                            continue
+                            if cost_price > 0:
+                                break
+
+                        if cost_price <= 0:
+                            continue
+
+                        # 4. Extraer título y modelo
+                        title_text = lines[0]
+                        if any(bad in title_text.lower() for bad in ["ver más", "view more", "filter", "todos", "vender", "swappa", "sell"]):
+                            continue
+
                         sale_price = round(cost_price * MARGEN_GANANCIA, 2)
 
-                        # Extraer imagen
+                        # 5. Extraer imagen
                         img_elem = await item.query_selector("img")
                         image_url = ""
                         if img_elem:
@@ -141,7 +156,8 @@ async def extraer_y_enviar():
                             if image_url and image_url.startswith("//"):
                                 image_url = "https:" + image_url
 
-                        storage = "Unlocked / Nicaragua" if categoria == "Celular" else "Estándar"
+                        # 6. Extraer capacidad / almacenamiento
+                        storage = "Nicaragua / Unlocked" if categoria == "Celular" else "Estándar"
                         for line in lines:
                             if any(unit in line.upper() for unit in ["GB", "TB"]):
                                 storage = line
@@ -149,17 +165,18 @@ async def extraer_y_enviar():
 
                         nombre_completo = f"{brand} {title_text}" if brand.lower() not in title_text.lower() else title_text
 
+                        # Estructura limpia ajustada al Webhook de Base44
                         producto = {
                             "title": nombre_completo,
                             "brand": brand,
                             "model": title_text,
-                            "condition": "Excelente / Usado Garantizado",
+                            "condition": "Good",  # Valida contra ALLOWED_CONDITIONS: ['Mint', 'Good', 'Fair']
                             "cost_price": cost_price,
                             "sale_price": sale_price,
                             "storage": storage,
                             "image_url": image_url,
                             "source_url": source_url,
-                            "category": categoria
+                            "status": "Draft"      # Guardar como Borrador en Base44
                         }
 
                         headers = {
@@ -170,7 +187,7 @@ async def extraer_y_enviar():
                         res = requests.post(BASE44_WEBHOOK_URL, json=producto, headers=headers, timeout=10)
                         
                         total_enviados += 1
-                        print(f"[{total_enviados}] [{categoria} - {brand}] {nombre_completo} | Costo: ${cost_price} -> Venta: ${sale_price} | Base44 Status: {res.status_code}")
+                        print(f"[{total_enviados}] [{categoria} - {brand}] {nombre_completo} | Costo: ${cost_price} -> Venta: ${sale_price} | Base44 Status: {res.status_code} ({res.json().get('action', 'response')})")
 
                     except Exception as item_error:
                         continue
