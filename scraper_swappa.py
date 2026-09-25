@@ -20,10 +20,10 @@ TARGET_URLS = [
     {"categoria": "Celular", "brand": "Google", "url": "https://swappa.com/buy/unlocked/google"},
     # LAPTOPS
     {"categoria": "Laptop", "brand": "Apple", "url": "https://swappa.com/buy/macbooks"},
-    {"categoria": "Laptop", "brand": "Dell", "url": "https://swappa.com/buy/laptops/dell"},
-    {"categoria": "Laptop", "brand": "HP", "url": "https://swappa.com/buy/laptops/hp"},
-    {"categoria": "Laptop", "brand": "Lenovo", "url": "https://swappa.com/buy/laptops/lenovo"},
-    {"categoria": "Laptop", "brand": "Asus", "url": "https://swappa.com/buy/laptops/asus"}
+    {"categoria": "Laptop", "brand": "Dell", "url": "https://swappa.com/buy/b/dell"},
+    {"categoria": "Laptop", "brand": "HP", "url": "https://swappa.com/buy/b/hp"},
+    {"categoria": "Laptop", "brand": "Lenovo", "url": "https://swappa.com/buy/b/lenovo"},
+    {"categoria": "Laptop", "brand": "Asus", "url": "https://swappa.com/buy/b/asus"}
 ]
 
 async def extraer_y_enviar():
