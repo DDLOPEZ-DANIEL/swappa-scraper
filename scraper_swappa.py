@@ -26,14 +26,14 @@ EXCLUDE_KEYWORDS = [
 ]
 
 TARGET_URLS = [
-    {"categoria": "Celular", "brand": "Apple", "url": "https://swappa.com/buy/used/iphones"},
-    {"categoria": "Celular", "brand": "Samsung", "url": "https://swappa.com/buy/used/samsung-phones"},
-    {"categoria": "Celular", "brand": "Google", "url": "https://swappa.com/buy/used/google-pixel"},
+    {"categoria": "Celular", "brand": "Apple", "url": "https://swappa.com/buy/unlocked/iphones"},
+    {"categoria": "Celular", "brand": "Samsung", "url": "https://swappa.com/buy/unlocked/samsung"},
+    {"categoria": "Celular", "brand": "Google", "url": "https://swappa.com/buy/unlocked/google"},
     {"categoria": "Laptop", "brand": "Apple", "url": "https://swappa.com/buy/macbooks"},
-    {"categoria": "Laptop", "brand": "Dell", "url": "https://swappa.com/buy/laptops/dell"},
-    {"categoria": "Laptop", "brand": "HP", "url": "https://swappa.com/buy/laptops/hp"},
-    {"categoria": "Laptop", "brand": "Lenovo", "url": "https://swappa.com/buy/laptops/lenovo"},
-    {"categoria": "Laptop", "brand": "Asus", "url": "https://swappa.com/buy/laptops/asus"}
+    {"categoria": "Laptop", "brand": "Dell", "url": "https://swappa.com/buy/b/dell"},
+    {"categoria": "Laptop", "brand": "HP", "url": "https://swappa.com/buy/b/hp"},
+    {"categoria": "Laptop", "brand": "Lenovo", "url": "https://swappa.com/buy/b/lenovo"},
+    {"categoria": "Laptop", "brand": "Asus", "url": "https://swappa.com/buy/b/asus"}
 ]
 
 async def extraer_detalles_json_ld(context, listing_url):
