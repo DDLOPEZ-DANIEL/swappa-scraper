@@ -11,7 +11,6 @@ BASE44_WEBHOOK_URL = os.getenv(
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "mi_clave1_secreta_swappa_2026")
 MARGEN_GANANCIA = 1.30
 
-# Palabras clave para omitir productos que no son Laptops ni Celulares
 EXCLUDE_KEYWORDS = [
     "printer", "rtx", "gtx", "geforce", "radeon", "graphics card", 
     "desktop", "optiplex", "prodesk", "ally", "legion go", "xg mobile"
@@ -29,56 +28,66 @@ TARGET_URLS = [
 ]
 
 async def extraer_galeria_y_detalles(context, listing_url):
-    """
-    Abre la publicación individual usando los selectores exactos del inspector:
-    - section#section_media a.featured_image
-    - section#section_media a.lightbox
-    """
     image_urls = []
     main_image_url = ""
     description = ""
-    specs = {}
     
     try:
         detail_page = await context.new_page()
-        # Esperar a que htmx/red termine de cargar las miniaturas
-        await detail_page.goto(listing_url, wait_until="networkidle", timeout=30000)
+        await detail_page.goto(listing_url, wait_until="domcontentloaded", timeout=30000)
         
-        # 1. Extraer Imagen Principal (Alta resolución desde el atributo 'href' del lightbox)
-        featured_img_elem = await detail_page.query_selector("section#section_media a.featured_image")
-        if featured_img_elem:
-            main_image_url = await featured_img_elem.get_attribute("href") or ""
-            if main_image_url.startswith("//"):
-                main_image_url = "https:" + main_image_url
+        # Esperar a que el contenedor de imágenes o el cuerpo de la página cargue
+        try:
+            await detail_page.wait_for_selector("section#section_media, div#medias_content, a.lightbox", timeout=5000)
+        except Exception:
+            pass
 
-        # 2. Extraer TODAS las imágenes de la galería
-        gallery_anchors = await detail_page.query_selector_all("section#section_media a.lightbox")
-        for a in gallery_anchors:
-            href = await a.get_attribute("href") or ""
+        # 1. Extraer Imagen Principal
+        featured_elem = await detail_page.query_selector("section#section_media a.featured_image, a.lightbox.featured_image, img.featured_image")
+        if featured_elem:
+            main_image_url = await featured_elem.get_attribute("href") or await featured_elem.get_attribute("src") or ""
+
+        # 2. Extraer todas las imágenes disponibles en la galería
+        img_anchors = await detail_page.query_selector_all("section#section_media a.lightbox, div#medias_content a, a[data-lightbox]")
+        for a in img_anchors:
+            href = await a.get_attribute("href") or await a.get_attribute("data-src") or ""
             if href:
                 if href.startswith("//"):
                     href = "https:" + href
                 if href not in image_urls and "avatar" not in href:
                     image_urls.append(href)
 
-        # Asegurar que la imagen principal esté al inicio si no fue capturada antes
-        if main_image_url and main_image_url not in image_urls:
-            image_urls.insert(0, main_image_url)
+        # Buscar imágenes <img> directamente si no se encontraron enlaces <a>
+        if not image_urls:
+            imgs = await detail_page.query_selector_all("section#section_media img, div#medias_content img")
+            for img in imgs:
+                src = await img.get_attribute("src") or await img.get_attribute("data-src") or ""
+                if src:
+                    if src.startswith("//"):
+                        src = "https:" + src
+                    if src not in image_urls and "avatar" not in src:
+                        image_urls.append(src)
 
-        # 3. Extraer Descripción
+        if main_image_url:
+            if main_image_url.startswith("//"):
+                main_image_url = "https:" + main_image_url
+            if main_image_url not in image_urls:
+                image_urls.insert(0, main_image_url)
+
+        # 3. Extraer Descripción del Vendedor
         desc_elem = await detail_page.query_selector("section#section_main .xui_card, .listing-description, .seller-notes")
         if desc_elem:
             description = (await desc_elem.inner_text()).strip()
 
         await detail_page.close()
     except Exception as e:
-        print(f"      [!] Error en detalles de {listing_url}: {e}")
+        print(f"      [!] Error en extracción de {listing_url}: {e}")
         
     return image_urls, main_image_url, description
 
 
 async def extraer_y_enviar():
-    print("Iniciando escaneo enriquecido hacia Base44...")
+    print("Iniciando escaneo corregido hacia Base44...")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -115,16 +124,13 @@ async def extraer_y_enviar():
                         lines = [l.strip() for l in text_content.split("\n") if l.strip()]
                         title_text = lines[0] if lines else f"{brand} Device"
                         
-                        # Filtro para omitir impresoras, GPUs y consolas
                         if any(k in title_text.lower() for k in EXCLUDE_KEYWORDS):
                             continue
 
-                        # Obtener enlace a la publicación individual
                         link_elem = await item.query_selector("a.stretched-link, a[href*='/listing/'], a[href*='/buy/']")
                         href = await link_elem.get_attribute("href") if link_elem else ""
                         source_url = "https://swappa.com" + href if href.startswith("/") else href
 
-                        # Precio
                         prices = re.findall(r'\$\s*([0-9,]+(?:\.[0-9]{2})?)', text_content)
                         cost_price = 0.0
                         if prices:
@@ -144,12 +150,12 @@ async def extraer_y_enviar():
                                 storage = line
                                 break
 
-                        # Extraer imágenes y detalles entrando al listing
                         galeria_fotos = []
                         main_image = ""
                         descripcion_detallada = f"Equipo {brand} {title_text} listo para envío."
 
-                        if source_url and "/listing/" in source_url:
+                        # Extraer fotos si la URL apunta a un producto/listing
+                        if source_url and ("/listing/" in source_url or "/buy/" in source_url):
                             galeria_fotos, main_image, descripcion_detallada = await extraer_galeria_y_detalles(context, source_url)
 
                         nombre_completo = f"{brand} {title_text}" if brand.lower() not in title_text.lower() else title_text
