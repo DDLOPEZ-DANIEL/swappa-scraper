@@ -35,64 +35,53 @@ async def extraer_galeria_y_detalles(context, listing_url):
     try:
         detail_page = await context.new_page()
         await detail_page.goto(listing_url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(1.5)
+
+        # 1. Buscar todas las imágenes de la galería (incluye LightGallery .lg-object e imágenes directas)
+        img_elements = await detail_page.query_selector_all("img.lg-object, img.lg-image, section img, div.media img, img[src*='/media/listing/']")
         
-        # Esperar a que el contenedor de imágenes o el cuerpo de la página cargue
-        try:
-            await detail_page.wait_for_selector("section#section_media, div#medias_content, a.lightbox", timeout=5000)
-        except Exception:
-            pass
+        for img in img_elements:
+            src = await img.get_attribute("src") or await img.get_attribute("data-src") or ""
+            if src:
+                if src.startswith("//"):
+                    src = "https:" + src
+                # Filtrar avatares o iconos no deseados y verificar que pertenezca a listings
+                if ("static.swappa.com/media/listing/" in src or "/media/listing/" in src) and src not in image_urls:
+                    image_urls.append(src)
 
-        # 1. Extraer Imagen Principal
-        featured_elem = await detail_page.query_selector("section#section_media a.featured_image, a.lightbox.featured_image, img.featured_image")
-        if featured_elem:
-            main_image_url = await featured_elem.get_attribute("href") or await featured_elem.get_attribute("src") or ""
-
-        # 2. Extraer todas las imágenes disponibles en la galería
-        img_anchors = await detail_page.query_selector_all("section#section_media a.lightbox, div#medias_content a, a[data-lightbox]")
-        for a in img_anchors:
-            href = await a.get_attribute("href") or await a.get_attribute("data-src") or ""
-            if href:
-                if href.startswith("//"):
-                    href = "https:" + href
-                if href not in image_urls and "avatar" not in href:
-                    image_urls.append(href)
-
-        # Buscar imágenes <img> directamente si no se encontraron enlaces <a>
+        # 2. Si no se hallaron por selector img directo, buscar enlaces a la galería
         if not image_urls:
-            imgs = await detail_page.query_selector_all("section#section_media img, div#medias_content img")
-            for img in imgs:
-                src = await img.get_attribute("src") or await img.get_attribute("data-src") or ""
-                if src:
-                    if src.startswith("//"):
-                        src = "https:" + src
-                    if src not in image_urls and "avatar" not in src:
-                        image_urls.append(src)
+            anchors = await detail_page.query_selector_all("a[href*='/media/listing/'], a.lightbox")
+            for a in anchors:
+                href = await a.get_attribute("href") or ""
+                if href:
+                    if href.startswith("//"):
+                        href = "https:" + href
+                    if href not in image_urls:
+                        image_urls.append(href)
 
-        if main_image_url:
-            if main_image_url.startswith("//"):
-                main_image_url = "https:" + main_image_url
-            if main_image_url not in image_urls:
-                image_urls.insert(0, main_image_url)
+        if image_urls:
+            main_image_url = image_urls[0]
 
-        # 3. Extraer Descripción del Vendedor
-        desc_elem = await detail_page.query_selector("section#section_main .xui_card, .listing-description, .seller-notes")
+        # 3. Extraer Descripción
+        desc_elem = await detail_page.query_selector("section .xui_card, .listing-description, .seller-notes, div[class*='description']")
         if desc_elem:
             description = (await desc_elem.inner_text()).strip()
 
         await detail_page.close()
     except Exception as e:
-        print(f"      [!] Error en extracción de {listing_url}: {e}")
+        print(f"      [!] Error navegando a detalle {listing_url}: {e}")
         
     return image_urls, main_image_url, description
 
 
 async def extraer_y_enviar():
-    print("Iniciando escaneo corregido hacia Base44...")
+    print("Iniciando escaneo optimizado hacia Base44...")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1440, "height": 900}
         )
         page = await context.new_page()
@@ -108,7 +97,7 @@ async def extraer_y_enviar():
                 print(f" Escaneando {categoria}s ({brand}) en: {target_url}")
                 print(f"=======================================================")
                 
-                response = await page.goto(target_url, wait_until="networkidle", timeout=60000)
+                response = await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
                 if not response or response.status != 200:
                     continue
 
@@ -150,13 +139,29 @@ async def extraer_y_enviar():
                                 storage = line
                                 break
 
+                        # Extraer foto preliminar del catálogo como respaldo
+                        backup_images = []
+                        cat_imgs = await item.query_selector_all("img")
+                        for c_img in cat_imgs:
+                            c_src = await c_img.get_attribute("src") or await c_img.get_attribute("data-src") or ""
+                            if c_src and "avatar" not in c_src:
+                                if c_src.startswith("//"):
+                                    c_src = "https:" + c_src
+                                if c_src not in backup_images:
+                                    backup_images.append(c_src)
+
                         galeria_fotos = []
                         main_image = ""
-                        descripcion_detallada = f"Equipo {brand} {title_text} listo para envío."
+                        descripcion_detallada = f"Equipo {brand} {title_text} disponible para compra."
 
-                        # Extraer fotos si la URL apunta a un producto/listing
+                        # Si hay URL de publicación, extraemos la galería completa de la página individual
                         if source_url and ("/listing/" in source_url or "/buy/" in source_url):
                             galeria_fotos, main_image, descripcion_detallada = await extraer_galeria_y_detalles(context, source_url)
+
+                        # Si la navegación individual no devolvió fotos, usamos las fotos de respaldo del catálogo
+                        if not galeria_fotos and backup_images:
+                            galeria_fotos = backup_images
+                            main_image = backup_images[0]
 
                         nombre_completo = f"{brand} {title_text}" if brand.lower() not in title_text.lower() else title_text
 
