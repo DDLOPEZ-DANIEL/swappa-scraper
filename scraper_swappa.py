@@ -11,6 +11,12 @@ BASE44_WEBHOOK_URL = os.getenv(
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "mi_clave1_secreta_swappa_2026")
 MARGEN_GANANCIA = 1.30
 
+# Palabras clave para omitir productos que no son Laptops ni Celulares
+EXCLUDE_KEYWORDS = [
+    "printer", "rtx", "gtx", "geforce", "radeon", "graphics card", 
+    "desktop", "optiplex", "prodesk", "ally", "legion go", "xg mobile"
+]
+
 TARGET_URLS = [
     {"categoria": "Celular", "brand": "Apple", "url": "https://swappa.com/buy/unlocked/iphones"},
     {"categoria": "Celular", "brand": "Samsung", "url": "https://swappa.com/buy/unlocked/samsung"},
@@ -23,47 +29,56 @@ TARGET_URLS = [
 ]
 
 async def extraer_galeria_y_detalles(context, listing_url):
-    """Abre la publicación individual del producto para extraer todas sus fotos y especificaciones técnicas."""
-    images = []
-    specs = {}
+    """
+    Abre la publicación individual usando los selectores exactos del inspector:
+    - section#section_media a.featured_image
+    - section#section_media a.lightbox
+    """
+    image_urls = []
+    main_image_url = ""
     description = ""
+    specs = {}
     
     try:
         detail_page = await context.new_page()
-        await detail_page.goto(listing_url, wait_until="domcontentloaded", timeout=25000)
+        # Esperar a que htmx/red termine de cargar las miniaturas
+        await detail_page.goto(listing_url, wait_until="networkidle", timeout=30000)
         
-        # 1. Extraer todas las fotos reales de la galería del vendedor
-        img_elements = await detail_page.query_selector_all("a[data-lightbox='listing-images'] img, .carousel-item img, img.listing-image, div.gallery img")
-        for img in img_elements:
-            src = await img.get_attribute("src") or await img.get_attribute("data-src") or ""
-            if src:
-                if src.startswith("//"):
-                    src = "https:" + src
-                if src not in images and "avatar" not in src:
-                    images.append(src)
+        # 1. Extraer Imagen Principal (Alta resolución desde el atributo 'href' del lightbox)
+        featured_img_elem = await detail_page.query_selector("section#section_media a.featured_image")
+        if featured_img_elem:
+            main_image_url = await featured_img_elem.get_attribute("href") or ""
+            if main_image_url.startswith("//"):
+                main_image_url = "https:" + main_image_url
 
-        # 2. Extraer descripción/notas del vendedor
-        desc_elem = await detail_page.query_selector(".listing-description, .condition-description, .seller-notes, div.section-body")
+        # 2. Extraer TODAS las imágenes de la galería
+        gallery_anchors = await detail_page.query_selector_all("section#section_media a.lightbox")
+        for a in gallery_anchors:
+            href = await a.get_attribute("href") or ""
+            if href:
+                if href.startswith("//"):
+                    href = "https:" + href
+                if href not in image_urls and "avatar" not in href:
+                    image_urls.append(href)
+
+        # Asegurar que la imagen principal esté al inicio si no fue capturada antes
+        if main_image_url and main_image_url not in image_urls:
+            image_urls.insert(0, main_image_url)
+
+        # 3. Extraer Descripción
+        desc_elem = await detail_page.query_selector("section#section_main .xui_card, .listing-description, .seller-notes")
         if desc_elem:
             description = (await desc_elem.inner_text()).strip()
 
-        # 3. Extraer tabla de especificaciones (RAM, Procesador, Color, etc.)
-        rows = await detail_page.query_selector_all("table.table-specs tr, div.spec-item, tr.spec_row")
-        for row in rows:
-            text = (await row.inner_text()).strip()
-            if ":" in text or "\t" in text:
-                parts = text.split(":" if ":" in text else "\t", 1)
-                specs[parts[0].strip().lower()] = parts[1].strip()
-
         await detail_page.close()
     except Exception as e:
-        print(f"      [!] Error leyendo detalles de {listing_url}: {e}")
+        print(f"      [!] Error en detalles de {listing_url}: {e}")
         
-    return images, description, specs
+    return image_urls, main_image_url, description
 
 
 async def extraer_y_enviar():
-    print(f"Iniciando escaneo enriquecido de imágenes y specs hacia Base44...")
+    print("Iniciando escaneo enriquecido hacia Base44...")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -97,12 +112,19 @@ async def extraer_y_enviar():
                         if not text_content:
                             continue
 
-                        # Obtener enlace a la publicación específica
+                        lines = [l.strip() for l in text_content.split("\n") if l.strip()]
+                        title_text = lines[0] if lines else f"{brand} Device"
+                        
+                        # Filtro para omitir impresoras, GPUs y consolas
+                        if any(k in title_text.lower() for k in EXCLUDE_KEYWORDS):
+                            continue
+
+                        # Obtener enlace a la publicación individual
                         link_elem = await item.query_selector("a.stretched-link, a[href*='/listing/'], a[href*='/buy/']")
                         href = await link_elem.get_attribute("href") if link_elem else ""
                         source_url = "https://swappa.com" + href if href.startswith("/") else href
 
-                        # Calcular precio
+                        # Precio
                         prices = re.findall(r'\$\s*([0-9,]+(?:\.[0-9]{2})?)', text_content)
                         cost_price = 0.0
                         if prices:
@@ -114,45 +136,24 @@ async def extraer_y_enviar():
                         if cost_price <= 0:
                             continue
 
-                        lines = [l.strip() for l in text_content.split("\n") if l.strip()]
-                        title_text = lines[0] if lines else f"{brand} Device"
                         sale_price = round(cost_price * MARGEN_GANANCIA, 2)
 
-                        # Valores por defecto
                         storage = "N/A"
-                        ram = "N/A"
-                        color = "N/A"
-                        processor = "N/A"
-
                         for line in lines:
                             if re.search(r'\b(64|128|256|512)\s*(GB|TB)\b', line, re.I):
                                 storage = line
-                            elif re.search(r'\b(4|8|12|16|32|64)\s*GB\b', line, re.I) and storage != line:
-                                ram = line
+                                break
 
-                        # Obtener galería completa y especificaciones detalladas entrando a la publicación
+                        # Extraer imágenes y detalles entrando al listing
                         galeria_fotos = []
-                        descripcion_detallada = f"Equipo {brand} {title_text} disponible en inventario."
+                        main_image = ""
+                        descripcion_detallada = f"Equipo {brand} {title_text} listo para envío."
 
-                        if source_url:
-                            galeria_fotos, descripcion_detallada, extra_specs = await extraer_galeria_y_detalles(context, source_url)
-                            
-                            # Asignar atributos si se encontraron en la página del producto
-                            ram = extra_specs.get("memoria ram instalada", extra_specs.get("ram", ram))
-                            processor = extra_specs.get("modelo de cpu", extra_specs.get("processor", processor))
-                            color = extra_specs.get("color", color)
-
-                        # Si la galería falló, usar la foto de la portada
-                        if not galeria_fotos:
-                            img_elem = await item.query_selector("img")
-                            if img_elem:
-                                main_img = await img_elem.get_attribute("src") or await img_elem.get_attribute("data-src") or ""
-                                if main_img:
-                                    galeria_fotos.append("https:" + main_img if main_img.startswith("//") else main_img)
+                        if source_url and "/listing/" in source_url:
+                            galeria_fotos, main_image, descripcion_detallada = await extraer_galeria_y_detalles(context, source_url)
 
                         nombre_completo = f"{brand} {title_text}" if brand.lower() not in title_text.lower() else title_text
 
-                        # Objeto estructurado para Base44
                         producto = {
                             "title": nombre_completo,
                             "brand": brand,
@@ -161,11 +162,8 @@ async def extraer_y_enviar():
                             "cost_price": cost_price,
                             "sale_price": sale_price,
                             "storage": storage,
-                            "ram": ram,
-                            "color": color,
-                            "processor": processor,
                             "description": descripcion_detallada,
-                            "image_url": galeria_fotos[0] if galeria_fotos else "",
+                            "image_url": main_image or (galeria_fotos[0] if galeria_fotos else ""),
                             "images": galeria_fotos,
                             "source_url": source_url,
                             "status": "Draft"
@@ -177,7 +175,7 @@ async def extraer_y_enviar():
                         total_enviados += 1
                         print(f"[{total_enviados}] [{categoria} - {brand}] {nombre_completo} | Fotos: {len(galeria_fotos)} | Base44: {res.status_code}")
 
-                    except Exception as e:
+                    except Exception:
                         continue
 
             except Exception as nav_error:
@@ -185,7 +183,7 @@ async def extraer_y_enviar():
 
         await browser.close()
         print(f"\n=======================================================")
-        print(f" Proceso finalizado. Equipos con imágenes y ficha completa en Base44: {total_enviados}")
+        print(f" Proceso finalizado. Total de equipos procesados: {total_enviados}")
         print(f"=======================================================")
 
 if __name__ == "__main__":
