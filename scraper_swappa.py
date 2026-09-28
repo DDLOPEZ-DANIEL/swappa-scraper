@@ -86,13 +86,19 @@ async def extraer_detalles_json_ld(context, listing_url):
             except Exception:
                 continue
 
-        # Fallback de precio en el DOM
+        # Fallback de precio en el DOM si no vino en JSON-LD
         if datos_producto["cost_price"] <= 0:
-            price_elem = soup.select_one("span.price, .listing-price, [itemprop='price'], .price")
+            price_elem = soup.select_one("span.price, .listing-price, [itemprop='price'], .price, .val-price")
             if price_elem:
                 raw_price = re.sub(r'[^\d.]', '', price_elem.text)
                 if raw_price:
                     datos_producto["cost_price"] = float(raw_price)
+
+        # Fallback de título si falló JSON-LD
+        if not datos_producto["title"]:
+            title_elem = soup.select_one("h1, .listing-title, title")
+            if title_elem:
+                datos_producto["title"] = title_elem.text.strip().split(" - ")[0]
 
         # Extraer Galería de Fotos Reales
         images = []
@@ -109,6 +115,53 @@ async def extraer_detalles_json_ld(context, listing_url):
         print(f"      [!] Error leyendo detalle en {listing_url}: {e}", flush=True)
         
     return datos_producto
+
+async def procesar_publicacion(context, surl, categoria, brand, total_enviados):
+    try:
+        detalles = await extraer_detalles_json_ld(context, surl)
+        cost_price = detalles["cost_price"]
+        if cost_price <= 0:
+            return total_enviados
+
+        title_text = detalles["title"] or f"{brand} {categoria}"
+        if any(k in title_text.lower() for k in EXCLUDE_KEYWORDS):
+            return total_enviados
+
+        sale_price = round(cost_price * MARGEN_GANANCIA, 2)
+        storage = "N/A"
+        match_storage = re.search(r'\b(64|128|256|512|1|2)\s*(GB|TB)\b', title_text, re.I)
+        if match_storage:
+            storage = match_storage.group(0)
+
+        galeria = detalles["gallery_images"]
+        main_image = galeria[0] if galeria else detalles["catalog_image"]
+
+        producto = {
+            "swappa_id": detalles["swappa_id"] or surl.split("/")[-1],
+            "title": title_text,
+            "brand": brand,
+            "category": categoria,
+            "condition": "Used",
+            "color": detalles["color"] or "N/A",
+            "seller": detalles["seller"] or "Swappa Seller",
+            "cost_price": cost_price,
+            "sale_price": sale_price,
+            "storage": storage,
+            "description": detalles["description"],
+            "image_url": main_image,
+            "images": galeria,
+            "source_url": surl,
+            "status": "Available"
+        }
+
+        headers = {"Content-Type": "application/json", "x-api-key": SCRAPER_API_KEY}
+        res = requests.post(BASE44_WEBHOOK_URL, json=producto, headers=headers, timeout=10)
+        total_enviados += 1
+        print(f"[{total_enviados}] [{categoria} - {brand}] {title_text} | ${cost_price} -> ${sale_price} | Base44: {res.status_code}", flush=True)
+    except Exception as e:
+        print(f"      [!] Error enviando publicación {surl}: {e}", flush=True)
+
+    return total_enviados
 
 async def ejecutar_extraccion_diaria():
     print("Iniciando escaneo masivo de Swappa hacia Base44...", flush=True)
@@ -152,123 +205,68 @@ async def ejecutar_extraccion_diaria():
                     await page.evaluate("window.scrollBy(0, 1000);")
                     await asyncio.sleep(1)
 
-                links = await page.query_selector_all("a[href*='/listing/'], a[href*='/buy/']")
+                # Obtener enlaces a modelos y publicaciones
+                links = await page.query_selector_all("a[href]")
                 found_urls = []
 
                 for l in links:
                     href = await l.get_attribute("href")
                     if href:
                         full_url = "https://swappa.com" + href if href.startswith("/") else href
-                        if full_url not in found_urls and full_url != target_url and not full_url.endswith("/buy"):
-                            found_urls.append(full_url)
+                        
+                        # Filtro para atrapar enlaces de modelos (/buy/...) y publicaciones (/listing/...)
+                        if any(pattern in full_url for pattern in ["/buy/", "/listing/", "/listings/"]):
+                            if full_url not in found_urls and full_url != target_url and not full_url.endswith("/buy"):
+                                found_urls.append(full_url)
 
                 print(f" -> Se encontraron {len(found_urls)} enlaces a procesar.", flush=True)
 
                 for source_url in found_urls:
-                    try:
-                        if "/listing/" not in source_url:
-                            try:
-                                model_page = await context.new_page()
-                                await model_page.goto(source_url, wait_until="domcontentloaded", timeout=25000)
-                                await asyncio.sleep(0.8)
-                                sub_links = await model_page.query_selector_all("a[href*='/listing/']")
-                                
-                                # Aplicar o ignorar el límite según MAX_PUBLICATIONS_PER_MODEL
-                                sub_links_to_process = sub_links if MAX_PUBLICATIONS_PER_MODEL <= 0 else sub_links[:MAX_PUBLICATIONS_PER_MODEL]
+                    # Caso A: Si la URL es directamente un anuncio individual (/listing/XYZ)
+                    if "/listing/" in source_url and "/buy/" not in source_url:
+                        total_enviados = await procesar_publicacion(context, source_url, categoria, brand, total_enviados)
+                    
+                    # Caso B: Es una página de modelo (ej: /buy/apple-iphone-13), entramos a buscar las ofertas
+                    else:
+                        try:
+                            model_page = await context.new_page()
+                            await model_page.goto(source_url, wait_until="domcontentloaded", timeout=25000)
+                            await asyncio.sleep(1)
 
-                                for sl in sub_links_to_process:
-                                    shref = await sl.get_attribute("href")
-                                    if shref:
-                                        surl = "https://swappa.com" + shref if shref.startswith("/") else shref
-                                        
-                                        detalles = await extraer_detalles_json_ld(context, surl)
-                                        cost_price = detalles["cost_price"]
-                                        if cost_price <= 0:
-                                            continue
+                            # Scroll en la página del modelo
+                            await model_page.evaluate("window.scrollBy(0, 800);")
+                            await asyncio.sleep(0.5)
 
-                                        title_text = detalles["title"] or f"{brand} {categoria}"
-                                        if any(k in title_text.lower() for k in EXCLUDE_KEYWORDS):
-                                            continue
+                            # Buscar anuncios de productos dentro del modelo
+                            sub_links = await model_page.query_selector_all("a[href*='/listing/']")
+                            
+                            sub_urls = []
+                            for sl in sub_links:
+                                shref = await sl.get_attribute("href")
+                                if shref:
+                                    surl = "https://swappa.com" + shref if shref.startswith("/") else shref
+                                    if surl not in sub_urls:
+                                        sub_urls.append(surl)
 
-                                        sale_price = round(cost_price * MARGEN_GANANCIA, 2)
-                                        storage = "N/A"
-                                        match_storage = re.search(r'\b(64|128|256|512|1|2)\s*(GB|TB)\b', title_text, re.I)
-                                        if match_storage:
-                                            storage = match_storage.group(0)
+                            if not sub_urls:
+                                # Intentar buscar en la vista de lista/tabla de ofertas de la página
+                                content = await model_page.content()
+                                soup = BeautifulSoup(content, 'html.parser')
+                                for a in soup.find_all('a', href=True):
+                                    href = a['href']
+                                    if '/listing/' in href:
+                                        surl = "https://swappa.com" + href if href.startswith("/") else href
+                                        if surl not in sub_urls:
+                                            sub_urls.append(surl)
 
-                                        galeria = detalles["gallery_images"]
-                                        main_image = galeria[0] if galeria else detalles["catalog_image"]
+                            sub_urls_to_process = sub_urls if MAX_PUBLICATIONS_PER_MODEL <= 0 else sub_urls[:MAX_PUBLICATIONS_PER_MODEL]
 
-                                        producto = {
-                                            "swappa_id": detalles["swappa_id"] or surl.split("/")[-1],
-                                            "title": title_text,
-                                            "brand": brand,
-                                            "category": categoria,
-                                            "condition": "Used",
-                                            "color": detalles["color"] or "N/A",
-                                            "seller": detalles["seller"] or "Swappa Seller",
-                                            "cost_price": cost_price,
-                                            "sale_price": sale_price,
-                                            "storage": storage,
-                                            "description": detalles["description"],
-                                            "image_url": main_image,
-                                            "images": galeria,
-                                            "source_url": surl,
-                                            "status": "Available"
-                                        }
+                            for surl in sub_urls_to_process:
+                                total_enviados = await procesar_publicacion(context, surl, categoria, brand, total_enviados)
 
-                                        headers = {"Content-Type": "application/json", "x-api-key": SCRAPER_API_KEY}
-                                        res = requests.post(BASE44_WEBHOOK_URL, json=producto, headers=headers, timeout=10)
-                                        total_enviados += 1
-                                        print(f"[{total_enviados}] [{categoria} - {brand}] {title_text} | $${cost_price} -> $${sale_price} | Base44: {res.status_code}", flush=True)
-
-                                await model_page.close()
-                            except Exception as model_err:
-                                continue
-                        else:
-                            detalles = await extraer_detalles_json_ld(context, source_url)
-                            cost_price = detalles["cost_price"]
-                            if cost_price <= 0:
-                                continue
-
-                            title_text = detalles["title"] or f"{brand} {categoria}"
-                            if any(k in title_text.lower() for k in EXCLUDE_KEYWORDS):
-                                continue
-
-                            sale_price = round(cost_price * MARGEN_GANANCIA, 2)
-                            storage = "N/A"
-                            match_storage = re.search(r'\b(64|128|256|512|1|2)\s*(GB|TB)\b', title_text, re.I)
-                            if match_storage:
-                                storage = match_storage.group(0)
-
-                            galeria = detalles["gallery_images"]
-                            main_image = galeria[0] if galeria else detalles["catalog_image"]
-
-                            producto = {
-                                "swappa_id": detalles["swappa_id"] or source_url.split("/")[-1],
-                                "title": title_text,
-                                "brand": brand,
-                                "category": categoria,
-                                "condition": "Used",
-                                "color": detalles["color"] or "N/A",
-                                "seller": detalles["seller"] or "Swappa Seller",
-                                "cost_price": cost_price,
-                                "sale_price": sale_price,
-                                "storage": storage,
-                                "description": detalles["description"],
-                                "image_url": main_image,
-                                "images": galeria,
-                                "source_url": source_url,
-                                "status": "Available"
-                            }
-
-                            headers = {"Content-Type": "application/json", "x-api-key": SCRAPER_API_KEY}
-                            res = requests.post(BASE44_WEBHOOK_URL, json=producto, headers=headers, timeout=10)
-                            total_enviados += 1
-                            print(f"[{total_enviados}] [{categoria} - {brand}] {title_text} | $${cost_price} -> $${sale_price} | Base44: {res.status_code}", flush=True)
-
-                    except Exception as item_err:
-                        continue
+                            await model_page.close()
+                        except Exception as model_err:
+                            continue
 
             except Exception as nav_error:
                 print(f"Error procesando sección {target_url}: {nav_error}", flush=True)
