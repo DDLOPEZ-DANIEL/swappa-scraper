@@ -100,14 +100,22 @@ async def extraer_detalles_json_ld(context, listing_url):
             if title_elem:
                 datos_producto["title"] = title_elem.text.strip().split(" - ")[0]
 
-        # Extraer Galería de Fotos Reales
+        # Extraer Galería de Fotos Reales (Ajustado a lightbox y la CDN de Swappa)
         images = []
-        for img in soup.find_all('img'):
-            src = img.get('src') or img.get('data-src') or ''
-            if src.startswith('//'):
-                src = 'https:' + src
-            if ('/media/listing/' in src or 'static.swappa.com/media/' in src or '/listing/' in src) and src not in images:
-                images.append(src)
+        for a in soup.select('#section_media a.lightbox, #section_media a[href*="/media/listing/"]'):
+            href = a.get('href') or ''
+            if href.startswith('//'):
+                href = 'https:' + href
+            if '/media/listing/' in href and href not in images:
+                images.append(href)
+
+        if not images:
+            for img in soup.find_all('img'):
+                src = img.get('src') or img.get('data-src') or ''
+                if src.startswith('//'):
+                    src = 'https:' + src
+                if '/media/listing/' in src and src not in images:
+                    images.append(src)
 
         datos_producto["gallery_images"] = images
         await detail_page.close()
@@ -155,7 +163,7 @@ async def procesar_publicacion(context, surl, categoria, brand, total_enviados):
         }
 
         headers = {"Content-Type": "application/json", "x-api-key": SCRAPER_API_KEY}
-        res = requests.post(BASE44_WEBHOOK_URL, json=producto, headers=headers, timeout=10)
+        res = requests.post(BASE44_WEBHOOK_URL, json=producto, headers=headers, timeout=20)
         total_enviados += 1
         print(f"[{total_enviados}] [{categoria} - {brand}] {title_text} | ${cost_price} -> ${sale_price} | Base44: {res.status_code}", flush=True)
     except Exception as e:
@@ -205,7 +213,6 @@ async def ejecutar_extraccion_diaria():
                     await page.evaluate("window.scrollBy(0, 1000);")
                     await asyncio.sleep(1)
 
-                # Obtener enlaces a modelos y publicaciones
                 links = await page.query_selector_all("a[href]")
                 found_urls = []
 
@@ -213,8 +220,6 @@ async def ejecutar_extraccion_diaria():
                     href = await l.get_attribute("href")
                     if href:
                         full_url = "https://swappa.com" + href if href.startswith("/") else href
-                        
-                        # Filtro para atrapar enlaces de modelos (/buy/...) y publicaciones (/listing/...)
                         if any(pattern in full_url for pattern in ["/buy/", "/listing/", "/listings/"]):
                             if full_url not in found_urls and full_url != target_url and not full_url.endswith("/buy"):
                                 found_urls.append(full_url)
@@ -222,22 +227,17 @@ async def ejecutar_extraccion_diaria():
                 print(f" -> Se encontraron {len(found_urls)} enlaces a procesar.", flush=True)
 
                 for source_url in found_urls:
-                    # Caso A: Si la URL es directamente un anuncio individual (/listing/XYZ)
                     if "/listing/" in source_url and "/buy/" not in source_url:
                         total_enviados = await procesar_publicacion(context, source_url, categoria, brand, total_enviados)
-                    
-                    # Caso B: Es una página de modelo (ej: /buy/apple-iphone-13), entramos a buscar las ofertas
                     else:
                         try:
                             model_page = await context.new_page()
                             await model_page.goto(source_url, wait_until="domcontentloaded", timeout=25000)
                             await asyncio.sleep(1)
 
-                            # Scroll en la página del modelo
                             await model_page.evaluate("window.scrollBy(0, 800);")
                             await asyncio.sleep(0.5)
 
-                            # Buscar anuncios de productos dentro del modelo
                             sub_links = await model_page.query_selector_all("a[href*='/listing/']")
                             
                             sub_urls = []
@@ -249,7 +249,6 @@ async def ejecutar_extraccion_diaria():
                                         sub_urls.append(surl)
 
                             if not sub_urls:
-                                # Intentar buscar en la vista de lista/tabla de ofertas de la página
                                 content = await model_page.content()
                                 soup = BeautifulSoup(content, 'html.parser')
                                 for a in soup.find_all('a', href=True):
@@ -265,7 +264,7 @@ async def ejecutar_extraccion_diaria():
                                 total_enviados = await procesar_publicacion(context, surl, categoria, brand, total_enviados)
 
                             await model_page.close()
-                        except Exception as model_err:
+                        except Exception:
                             continue
 
             except Exception as nav_error:
