@@ -4,6 +4,8 @@ import re
 import json
 import sys
 import requests
+from datetime import datetime, timedelta
+import zoneinfo
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
@@ -15,7 +17,6 @@ BASE44_WEBHOOK_URL = os.getenv(
     "https://rebit-smart-grid.base44.app/functions/swappaWebhook"
 )
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "mi_clave1_secreta_swappa_2026")
-MARGEN_GANANCIA = 1.30
 
 # Límite por modelo: 0 significa SIN LÍMITE (extrae todas las publicaciones encontradas)
 MAX_PUBLICATIONS_PER_MODEL = int(os.getenv("MAX_PUBLICATIONS_PER_MODEL", "0"))
@@ -45,7 +46,8 @@ async def extraer_detalles_json_ld(context, listing_url):
         "color": "",
         "seller": "",
         "catalog_image": "",
-        "gallery_images": []
+        "gallery_images": [],
+        "is_available": True  # Control de disponibilidad
     }
     
     try:
@@ -55,7 +57,20 @@ async def extraer_detalles_json_ld(context, listing_url):
         content = await detail_page.content()
         soup = BeautifulSoup(content, 'html.parser')
 
-        # Extraer datos JSON-LD estructurados
+        # 1. VERIFICAR SI EL PRODUCTO ESTÁ VENDIDO O NO DISPONIBLE
+        text_content_lower = soup.get_text().lower()
+        sold_indicators = ["listing sold", "this listing has been sold", "out of stock", "no longer available"]
+        
+        # Buscar badges o textos de estado en el DOM
+        status_badges = soup.select(".badge, .status, .label, .listing-status")
+        badge_text = " ".join([b.get_text().lower() for b in status_badges])
+        
+        if any(ind in text_content_lower for ind in sold_indicators) or "sold" in badge_text:
+            datos_producto["is_available"] = False
+            await detail_page.close()
+            return datos_producto
+
+        # 2. Extraer datos JSON-LD estructurados
         json_ld_scripts = soup.find_all('script', type='application/ld+json')
         for script in json_ld_scripts:
             if not script.string:
@@ -65,7 +80,6 @@ async def extraer_detalles_json_ld(context, listing_url):
                 if isinstance(schema_data, dict) and schema_data.get("@type") in ["Product", "IndividualProduct", "Offer"]:
                     datos_producto["swappa_id"] = str(schema_data.get("productID") or schema_data.get("sku") or listing_url.split("/")[-1])
                     datos_producto["title"] = schema_data.get("name", "")
-                    datos_producto["description"] = schema_data.get("description", "")
                     datos_producto["color"] = schema_data.get("color", "")
                     
                     img = schema_data.get("image")
@@ -79,12 +93,25 @@ async def extraer_detalles_json_ld(context, listing_url):
                         if isinstance(offers, dict):
                             datos_producto["cost_price"] = float(offers.get("price", 0.0))
                             datos_producto["seller"] = offers.get("seller", {}).get("name", "")
+                            # Check disponibilidad en offer
+                            if offers.get("availability", "").endswith("OutOfStock") or offers.get("availability", "").endswith("SoldOut"):
+                                datos_producto["is_available"] = False
                         elif isinstance(offers, list) and len(offers) > 0:
                             datos_producto["cost_price"] = float(offers[0].get("price", 0.0))
                             datos_producto["seller"] = offers[0].get("seller", {}).get("name", "")
                     break
             except Exception:
                 continue
+
+        # 3. EXTRAER DESCRIPCIÓN COMPLETA (PARTE SUPERIOR E INFERIOR)
+        desc_elem = soup.select_one("#listing_description, .listing-description, [itemprop='description']")
+        if desc_elem:
+            datos_producto["description"] = desc_elem.get_text(separator="\n", strip=True)
+        else:
+            # Fallback a la sección completa de descripción
+            section_desc = soup.find("section", class_="section_description")
+            if section_desc:
+                datos_producto["description"] = section_desc.get_text(separator="\n", strip=True)
 
         # Fallback de precio en el DOM si no vino en JSON-LD
         if datos_producto["cost_price"] <= 0:
@@ -100,7 +127,7 @@ async def extraer_detalles_json_ld(context, listing_url):
             if title_elem:
                 datos_producto["title"] = title_elem.text.strip().split(" - ")[0]
 
-        # Extraer Galería de Fotos Reales (Ajustado a lightbox y la CDN de Swappa)
+        # Extraer Galería de Fotos Reales
         images = []
         for a in soup.select('#section_media a.lightbox, #section_media a[href*="/media/listing/"]'):
             href = a.get('href') or ''
@@ -127,6 +154,12 @@ async def extraer_detalles_json_ld(context, listing_url):
 async def procesar_publicacion(context, surl, categoria, brand, total_enviados):
     try:
         detalles = await extraer_detalles_json_ld(context, surl)
+        
+        # SI ESTÁ VENDIDO O NO ESTÁ DISPONIBLE, IGNORAR Y NO ENVIAR A BASE44
+        if not detalles["is_available"]:
+            print(f"  [X] Omitido (Producto Vendido / Agotado): {surl}", flush=True)
+            return total_enviados
+
         cost_price = detalles["cost_price"]
         if cost_price <= 0:
             return total_enviados
@@ -135,7 +168,6 @@ async def procesar_publicacion(context, surl, categoria, brand, total_enviados):
         if any(k in title_text.lower() for k in EXCLUDE_KEYWORDS):
             return total_enviados
 
-        sale_price = round(cost_price * MARGEN_GANANCIA, 2)
         storage = "N/A"
         match_storage = re.search(r'\b(64|128|256|512|1|2)\s*(GB|TB)\b', title_text, re.I)
         if match_storage:
@@ -144,6 +176,7 @@ async def procesar_publicacion(context, surl, categoria, brand, total_enviados):
         galeria = detalles["gallery_images"]
         main_image = galeria[0] if galeria else detalles["catalog_image"]
 
+        # Se envía únicamente 'cost_price' limpio
         producto = {
             "swappa_id": detalles["swappa_id"] or surl.split("/")[-1],
             "title": title_text,
@@ -153,7 +186,6 @@ async def procesar_publicacion(context, surl, categoria, brand, total_enviados):
             "color": detalles["color"] or "N/A",
             "seller": detalles["seller"] or "Swappa Seller",
             "cost_price": cost_price,
-            "sale_price": sale_price,
             "storage": storage,
             "description": detalles["description"],
             "image_url": main_image,
@@ -165,7 +197,7 @@ async def procesar_publicacion(context, surl, categoria, brand, total_enviados):
         headers = {"Content-Type": "application/json", "x-api-key": SCRAPER_API_KEY}
         res = requests.post(BASE44_WEBHOOK_URL, json=producto, headers=headers, timeout=20)
         total_enviados += 1
-        print(f"[{total_enviados}] [{categoria} - {brand}] {title_text} | ${cost_price} -> ${sale_price} | Base44: {res.status_code}", flush=True)
+        print(f"[{total_enviados}] [{categoria} - {brand}] {title_text} | Costo Swappa: ${cost_price} | Base44: {res.status_code}", flush=True)
     except Exception as e:
         print(f"      [!] Error enviando publicación {surl}: {e}", flush=True)
 
@@ -275,12 +307,35 @@ async def ejecutar_extraccion_diaria():
         print(f" Ciclo completado. Equipos procesados y subidos: {total_enviados}", flush=True)
         print(f"=======================================================", flush=True)
 
+async def esperar_hasta_10_30_pm():
+    """
+    Calcula los segundos faltantes hasta las 10:30 PM (22:30) hora de Nicaragua
+    y duerme el proceso hasta llegar a ese momento exacto.
+    """
+    tz_nicaragua = zoneinfo.ZoneInfo("America/Managua")
+    ahora = datetime.now(tz_nicaragua)
+    
+    # Fijar la meta para las 22:30:00 de hoy
+    meta = ahora.replace(hour=22, minute=30, second=0, microsecond=0)
+    
+    # Si ya pasaron las 10:30 PM de hoy, programar para las 10:30 PM de mañana
+    if ahora >= meta:
+        meta += timedelta(days=1)
+        
+    segundos_espera = (meta - ahora).total_seconds()
+    horas_espera = segundos_espera / 3600
+    
+    print(f"\n[HORARIO PROGRAMADO] Hora actual Nicaragua: {ahora.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"[HORARIO PROGRAMADO] Próximo escaneo a las: {meta.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"[HORARIO PROGRAMADO] Esperando {horas_espera:.2f} horas ({int(segundos_espera)} segundos)...\n", flush=True)
+    
+    await asyncio.sleep(segundos_espera)
+
 async def main():
-    SEGUNDOS_UN_DIA = 86400
     while True:
+        # Esperar hasta las 10:30 PM hora Nicaragua antes de iniciar cada ciclo
+        await esperar_hasta_10_30_pm()
         await ejecutar_extraccion_diaria()
-        print(f"Esperando 24 horas para la siguiente actualización...", flush=True)
-        await asyncio.sleep(SEGUNDOS_UN_DIA)
 
 if __name__ == "__main__":
     asyncio.run(main())
