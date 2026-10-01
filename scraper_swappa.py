@@ -61,7 +61,6 @@ async def extraer_detalles_json_ld(context, listing_url):
         text_content_lower = soup.get_text().lower()
         sold_indicators = ["listing sold", "this listing has been sold", "out of stock", "no longer available"]
         
-        # Buscar badges o textos de estado en el DOM
         status_badges = soup.select(".badge, .status, .label, .listing-status")
         badge_text = " ".join([b.get_text().lower() for b in status_badges])
         
@@ -93,7 +92,6 @@ async def extraer_detalles_json_ld(context, listing_url):
                         if isinstance(offers, dict):
                             datos_producto["cost_price"] = float(offers.get("price", 0.0))
                             datos_producto["seller"] = offers.get("seller", {}).get("name", "")
-                            # Check disponibilidad en offer
                             if offers.get("availability", "").endswith("OutOfStock") or offers.get("availability", "").endswith("SoldOut"):
                                 datos_producto["is_available"] = False
                         elif isinstance(offers, list) and len(offers) > 0:
@@ -103,15 +101,37 @@ async def extraer_detalles_json_ld(context, listing_url):
             except Exception:
                 continue
 
-        # 3. EXTRAER DESCRIPCIÓN COMPLETA (PARTE SUPERIOR E INFERIOR)
-        desc_elem = soup.select_one("#listing_description, .listing-description, [itemprop='description']")
-        if desc_elem:
-            datos_producto["description"] = desc_elem.get_text(separator="\n", strip=True)
-        else:
-            # Fallback a la sección completa de descripción
-            section_desc = soup.find("section", class_="section_description")
-            if section_desc:
-                datos_producto["description"] = section_desc.get_text(separator="\n", strip=True)
+        # 3. EXTRAER DESCRIPCIÓN ROBUSTA (ATRIBUTOS + HEADLINE + DETALLES DE DAÑOS)
+        desc_parts = []
+
+        # A. Atributos superiores (Condición, Estado de Red, Capacidad)
+        attr_elements = soup.select(".attrs .attr, .listing-attrs .attr")
+        if attr_elements:
+            attrs_text = " - ".join([a.get_text(strip=True) for a in attr_elements if a.get_text(strip=True)])
+            if attrs_text:
+                desc_parts.append(f"Atributos del equipo: {attrs_text}")
+
+        # B. Notas del vendedor / Titular principal
+        headline_elem = soup.select_one("#section_headline, .headline, #seller_notes, .listing-description, #listing_description")
+        if headline_elem:
+            text_hl = headline_elem.get_text(separator=" ", strip=True)
+            if text_hl and text_hl not in desc_parts:
+                desc_parts.append(f"Notas del vendedor: {text_hl}")
+
+        # C. Sección de Daños o Detalle Estético
+        damage_elem = soup.select_one("#seller_damage_description, .damage-description, #section_description")
+        if damage_elem:
+            text_dmg = damage_elem.get_text(separator=" ", strip=True)
+            if text_dmg and text_dmg not in desc_parts:
+                desc_parts.append(f"Detalles adicionales / Daños: {text_dmg}")
+
+        # D. Fallback Meta Tags si no se encontró en el DOM
+        if not desc_parts:
+            meta_desc = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+            if meta_desc and meta_desc.get("content"):
+                desc_parts.append(meta_desc["content"].strip())
+
+        datos_producto["description"] = "\n\n".join(desc_parts) if desc_parts else "Sin descripción provista por el vendedor."
 
         # Fallback de precio en el DOM si no vino en JSON-LD
         if datos_producto["cost_price"] <= 0:
@@ -176,7 +196,6 @@ async def procesar_publicacion(context, surl, categoria, brand, total_enviados):
         galeria = detalles["gallery_images"]
         main_image = galeria[0] if galeria else detalles["catalog_image"]
 
-        # Se envía únicamente 'cost_price' limpio
         producto = {
             "swappa_id": detalles["swappa_id"] or surl.split("/")[-1],
             "title": title_text,
@@ -334,8 +353,8 @@ async def esperar_hasta_10_30_pm():
 async def main():
     while True:
         # Esperar hasta las 10:30 PM hora Nicaragua antes de iniciar cada ciclo
-        await esperar_hasta_10_30_pm()
         await ejecutar_extraccion_diaria()
+        await esperar_hasta_10_30_pm()
 
 if __name__ == "__main__":
     asyncio.run(main())
