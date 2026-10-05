@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import zoneinfo
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from deep_translator import GoogleTranslator
 
 # Forzar salida en vivo en la consola de Docker / Railway
 sys.stdout.reconfigure(line_buffering=True)
@@ -36,6 +37,20 @@ TARGET_URLS = [
     {"categoria": "Laptop", "brand": "Lenovo", "url": "https://swappa.com/buy/b/lenovo"},
     {"categoria": "Laptop", "brand": "Asus", "url": "https://swappa.com/buy/b/asus"}
 ]
+
+def traducir_texto(texto: str) -> str:
+    """
+    Traduce cualquier bloque de texto de inglés a español.
+    Retorna el texto original si ocurre una excepción.
+    """
+    if not texto or not texto.strip():
+        return ""
+    try:
+        translator = GoogleTranslator(source='auto', target='es')
+        return translator.translate(texto)
+    except Exception as e:
+        print(f"      [!] Error en traducción: {e}. Retornando texto original.", flush=True)
+        return texto
 
 async def extraer_detalles_json_ld(context, listing_url):
     datos_producto = {
@@ -101,37 +116,40 @@ async def extraer_detalles_json_ld(context, listing_url):
             except Exception:
                 continue
 
-        # 3. EXTRAER DESCRIPCIÓN ROBUSTA (ATRIBUTOS + HEADLINE + DETALLES DE DAÑOS)
+        # 3. EXTRAER Y TRADUCIR DESCRIPCIÓN ROBUSTA (LAPTOPS Y CELULARES)
         desc_parts = []
 
-        # A. Atributos superiores (Condición, Estado de Red, Capacidad)
-        attr_elements = soup.select(".attrs .attr, .listing-attrs .attr")
+        # A. Atributos / Especificaciones Técnicas (Compatibilidad dual: Laptops y Celulares)
+        attr_elements = soup.select(".attrs .attr, .listing-attrs .attr, .specs .spec, .tech-specs .spec")
         if attr_elements:
             attrs_text = " - ".join([a.get_text(strip=True) for a in attr_elements if a.get_text(strip=True)])
             if attrs_text:
-                desc_parts.append(f"Atributos del equipo: {attrs_text}")
+                desc_parts.append(f"Especificaciones del equipo: {attrs_text}")
 
         # B. Notas del vendedor / Titular principal
-        headline_elem = soup.select_one("#section_headline, .headline, #seller_notes, .listing-description, #listing_description")
+        headline_elem = soup.select_one("#section_headline, .headline, #seller_notes, .listing-description, #listing_description, .seller-notes")
         if headline_elem:
             text_hl = headline_elem.get_text(separator=" ", strip=True)
             if text_hl and text_hl not in desc_parts:
                 desc_parts.append(f"Notas del vendedor: {text_hl}")
 
-        # C. Sección de Daños o Detalle Estético
-        damage_elem = soup.select_one("#seller_damage_description, .damage-description, #section_description")
+        # C. Sección de Daños o Detalles Estéticos
+        damage_elem = soup.select_one("#seller_damage_description, .damage-description, #section_description, .condition-notes")
         if damage_elem:
             text_dmg = damage_elem.get_text(separator=" ", strip=True)
             if text_dmg and text_dmg not in desc_parts:
-                desc_parts.append(f"Detalles adicionales / Daños: {text_dmg}")
+                desc_parts.append(f"Detalles adicionales / Estado estético: {text_dmg}")
 
-        # D. Fallback Meta Tags si no se encontró en el DOM
+        # D. Fallback Meta Tags si no se encontró información en el DOM
         if not desc_parts:
             meta_desc = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
             if meta_desc and meta_desc.get("content"):
                 desc_parts.append(meta_desc["content"].strip())
 
-        datos_producto["description"] = "\n\n".join(desc_parts) if desc_parts else "Sin descripción provista por el vendedor."
+        descripcion_ingles = "\n\n".join(desc_parts) if desc_parts else "Sin descripción provista por el vendedor."
+
+        # Traducir la descripción consolidada al español
+        datos_producto["description"] = traducir_texto(descripcion_ingles)
 
         # Fallback de precio en el DOM si no vino en JSON-LD
         if datos_producto["cost_price"] <= 0:
