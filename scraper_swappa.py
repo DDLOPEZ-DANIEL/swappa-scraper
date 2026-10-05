@@ -8,7 +8,6 @@ from datetime import datetime, timedelta
 import zoneinfo
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
-from deep_translator import GoogleTranslator
 
 # Forzar salida en vivo en la consola de Docker / Railway
 sys.stdout.reconfigure(line_buffering=True)
@@ -24,7 +23,7 @@ MAX_PUBLICATIONS_PER_MODEL = int(os.getenv("MAX_PUBLICATIONS_PER_MODEL", "0"))
 
 EXCLUDE_KEYWORDS = [
     "printer", "rtx", "gtx", "geforce", "radeon", "graphics card", 
-    "desktop", "optiplex", "prodesk", "ally", "legion go", "xg mobile"
+    "desktop", "optiplex", "prodesk", "ally", "legion go", "xg mobile", "vision pro"
 ]
 
 TARGET_URLS = [
@@ -37,20 +36,6 @@ TARGET_URLS = [
     {"categoria": "Laptop", "brand": "Lenovo", "url": "https://swappa.com/buy/b/lenovo"},
     {"categoria": "Laptop", "brand": "Asus", "url": "https://swappa.com/buy/b/asus"}
 ]
-
-def traducir_texto(texto: str) -> str:
-    """
-    Traduce cualquier bloque de texto de inglés a español.
-    Retorna el texto original si ocurre una excepción.
-    """
-    if not texto or not texto.strip():
-        return ""
-    try:
-        translator = GoogleTranslator(source='auto', target='es')
-        return translator.translate(texto)
-    except Exception as e:
-        print(f"      [!] Error en traducción: {e}. Retornando texto original.", flush=True)
-        return texto
 
 async def extraer_detalles_json_ld(context, listing_url):
     datos_producto = {
@@ -116,15 +101,15 @@ async def extraer_detalles_json_ld(context, listing_url):
             except Exception:
                 continue
 
-        # 3. EXTRAER Y TRADUCIR DESCRIPCIÓN ROBUSTA (LAPTOPS Y CELULARES)
+        # 3. EXTRAER DESCRIPCIÓN ROBUSTA (LAPTOPS Y CELULARES)
         desc_parts = []
 
-        # A. Atributos / Especificaciones Técnicas (Compatibilidad dual: Laptops y Celulares)
+        # A. Atributos / Especificaciones Técnicas (Laptops y Celulares)
         attr_elements = soup.select(".attrs .attr, .listing-attrs .attr, .specs .spec, .tech-specs .spec")
         if attr_elements:
             attrs_text = " - ".join([a.get_text(strip=True) for a in attr_elements if a.get_text(strip=True)])
             if attrs_text:
-                desc_parts.append(f"Especificaciones del equipo: {attrs_text}")
+                desc_parts.append(f"Atributos / Especificaciones del equipo: {attrs_text}")
 
         # B. Notas del vendedor / Titular principal
         headline_elem = soup.select_one("#section_headline, .headline, #seller_notes, .listing-description, #listing_description, .seller-notes")
@@ -146,10 +131,7 @@ async def extraer_detalles_json_ld(context, listing_url):
             if meta_desc and meta_desc.get("content"):
                 desc_parts.append(meta_desc["content"].strip())
 
-        descripcion_ingles = "\n\n".join(desc_parts) if desc_parts else "Sin descripción provista por el vendedor."
-
-        # Traducir la descripción consolidada al español
-        datos_producto["description"] = traducir_texto(descripcion_ingles)
+        datos_producto["description"] = "\n\n".join(desc_parts) if desc_parts else "Sin descripción provista por el vendedor."
 
         # Fallback de precio en el DOM si no vino en JSON-LD
         if datos_producto["cost_price"] <= 0:

@@ -2,4 +2,3 @@ playwright
 beautifulsoup4
 requests
 tzdata
-deep-translator
