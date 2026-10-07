@@ -9,9 +9,9 @@ import zoneinfo
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
+# Forzar salida en vivo en la consola de Railway
 sys.stdout.reconfigure(line_buffering=True)
 
-# URL por defecto (Actualízala con la nueva URL de tu dominio en la variable de entorno BASE44_WEBHOOK_URL)
 BASE44_WEBHOOK_URL = os.getenv(
     "BASE44_WEBHOOK_URL", 
     "https://rebit-ad09a6b3.base44.app/functions/swappaWebhook"
@@ -36,6 +36,17 @@ TARGET_URLS = [
     {"categoria": "Laptop", "brand": "Asus", "url": "https://swappa.com/buy/b/asus"}
 ]
 
+def enviar_producto_a_base44(producto):
+    headers = {"Content-Type": "application/json", "x-api-key": SCRAPER_API_KEY}
+    try:
+        res = requests.post(BASE44_WEBHOOK_URL, json=producto, headers=headers, timeout=15)
+        if res.status_code == 200:
+            print(f"      [-> BASE44 OK 200] Guardado: {producto['title']} (${producto['cost_price']})", flush=True)
+        else:
+            print(f"      [-> BASE44 ERR {res.status_code}] {res.text[:100]}", flush=True)
+    except Exception as e:
+        print(f"      [!] Error enviando a Base44: {e}", flush=True)
+
 async def extraer_detalles_json_ld(context, listing_url):
     datos_producto = {
         "swappa_id": "",
@@ -52,7 +63,7 @@ async def extraer_detalles_json_ld(context, listing_url):
     try:
         detail_page = await context.new_page()
         await detail_page.goto(listing_url, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
         content = await detail_page.content()
         soup = BeautifulSoup(content, 'html.parser')
 
@@ -102,7 +113,7 @@ async def extraer_detalles_json_ld(context, listing_url):
         if attr_elements:
             attrs_text = " - ".join([a.get_text(strip=True) for a in attr_elements if a.get_text(strip=True)])
             if attrs_text:
-                desc_parts.append(f"Atributos / Especificaciones del equipo: {attrs_text}")
+                desc_parts.append(f"Atributos / Especificaciones: {attrs_text}")
 
         headline_elem = soup.select_one("#section_headline, .headline, #seller_notes, .listing-description, #listing_description, .seller-notes")
         if headline_elem:
@@ -114,7 +125,7 @@ async def extraer_detalles_json_ld(context, listing_url):
         if damage_elem:
             text_dmg = damage_elem.get_text(separator=" ", strip=True)
             if text_dmg and text_dmg not in desc_parts:
-                desc_parts.append(f"Detalles adicionales / Estado estético: {text_dmg}")
+                desc_parts.append(f"Detalles adicionales: {text_dmg}")
 
         if not desc_parts:
             meta_desc = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
@@ -158,15 +169,15 @@ async def extraer_detalles_json_ld(context, listing_url):
         
     return datos_producto
 
-async def extraer_producto_objeto(context, surl, categoria, brand):
+async def procesar_y_enviar_producto(context, surl, categoria, brand, contador):
     try:
         detalles = await extraer_detalles_json_ld(context, surl)
         if not detalles["is_available"] or detalles["cost_price"] <= 0:
-            return None
+            return False
 
         title_text = detalles["title"] or f"{brand} {categoria}"
         if any(k in title_text.lower() for k in EXCLUDE_KEYWORDS):
-            return None
+            return False
 
         storage = "N/A"
         match_storage = re.search(r'\b(64|128|256|512|1|2)\s*(GB|TB)\b', title_text, re.I)
@@ -176,7 +187,7 @@ async def extraer_producto_objeto(context, surl, categoria, brand):
         galeria = detalles["gallery_images"]
         main_image = galeria[0] if galeria else detalles["catalog_image"]
 
-        return {
+        p_obj = {
             "swappa_id": detalles["swappa_id"] or surl.split("/")[-1],
             "title": title_text,
             "brand": brand,
@@ -192,13 +203,17 @@ async def extraer_producto_objeto(context, surl, categoria, brand):
             "source_url": surl,
             "status": "Available"
         }
+
+        print(f"  [+] #{contador} Extraído [{categoria}] {title_text}", flush=True)
+        enviar_producto_a_base44(p_obj)
+        return True
     except Exception as e:
         print(f"      [!] Error procesando objeto {surl}: {e}", flush=True)
-        return None
+        return False
 
 async def ejecutar_extraccion_diaria():
-    print("Iniciando escaneo masivo de Swappa hacia Base44...", flush=True)
-    productos_recolectados = []
+    print("Iniciando escaneo masivo de Swappa con envío en tiempo real hacia Base44...", flush=True)
+    contador_total = 0
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -242,16 +257,15 @@ async def ejecutar_extraccion_diaria():
 
                 for source_url in found_urls:
                     if "/listing/" in source_url and "/buy/" not in source_url:
-                        p_obj = await extraer_producto_objeto(context, source_url, categoria, brand)
-                        if p_obj:
-                            productos_recolectados.append(p_obj)
+                        contador_total += 1
+                        await procesar_y_enviar_producto(context, source_url, categoria, brand, contador_total)
                     else:
                         try:
                             model_page = await context.new_page()
                             await model_page.goto(source_url, wait_until="domcontentloaded", timeout=25000)
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(0.8)
                             await model_page.evaluate("window.scrollBy(0, 800);")
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(0.4)
 
                             sub_links = await model_page.query_selector_all("a[href*='/listing/']")
                             sub_urls = []
@@ -265,9 +279,8 @@ async def ejecutar_extraccion_diaria():
                             sub_urls_to_process = sub_urls if MAX_PUBLICATIONS_PER_MODEL <= 0 else sub_urls[:MAX_PUBLICATIONS_PER_MODEL]
 
                             for surl in sub_urls_to_process:
-                                p_obj = await extraer_producto_objeto(context, surl, categoria, brand)
-                                if p_obj:
-                                    productos_recolectados.append(p_obj)
+                                contador_total += 1
+                                await procesar_y_enviar_producto(context, surl, categoria, brand, contador_total)
 
                             await model_page.close()
                         except Exception:
@@ -277,16 +290,9 @@ async def ejecutar_extraccion_diaria():
                 print(f"Error procesando sección {target_url}: {nav_error}", flush=True)
 
         await browser.close()
-
-        # ENVÍO EN LOTE (RECONCILE) A BASE44
-        print(f"\n[ENVIANDO LOTE] Total de productos recolectados: {len(productos_recolectados)}", flush=True)
-        if productos_recolectados:
-            try:
-                headers = {"Content-Type": "application/json", "x-api-key": SCRAPER_API_KEY}
-                res = requests.post(BASE44_WEBHOOK_URL, json=productos_recolectados, headers=headers, timeout=60)
-                print(f"[BASE44 RES] Código: {res.status_code} | Respuesta: {res.text}", flush=True)
-            except Exception as req_err:
-                print(f"[!] Error enviando lote a Base44: {req_err}", flush=True)
+        print(f"\n=======================================================", flush=True)
+        print(f" Escaneo completado. Total de productos enviados a Base44: {contador_total}", flush=True)
+        print(f"=======================================================", flush=True)
 
 async def esperar_hasta_10_30_pm():
     tz_nicaragua = zoneinfo.ZoneInfo("America/Managua")
@@ -295,7 +301,8 @@ async def esperar_hasta_10_30_pm():
     if ahora >= meta:
         meta += timedelta(days=1)
     segundos_espera = (meta - ahora).total_seconds()
-    print(f"\n[PROGRAMADO] Esperando {segundos_espera / 3600:.2f} horas...", flush=True)
+    print(f"\n[HORARIO PROGRAMADO] Próximo escaneo a las: {meta.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"[HORARIO PROGRAMADO] Esperando {segundos_espera / 3600:.2f} horas...\n", flush=True)
     await asyncio.sleep(segundos_espera)
 
 async def main():
