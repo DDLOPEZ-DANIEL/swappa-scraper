@@ -3,6 +3,7 @@ import os
 import re
 import json
 import sys
+import hashlib
 import requests
 from datetime import datetime, timedelta
 import zoneinfo
@@ -19,6 +20,7 @@ BASE44_WEBHOOK_URL = os.getenv(
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "mi_clave1_secreta_swappa_2026")
 
 MAX_PUBLICATIONS_PER_MODEL = int(os.getenv("MAX_PUBLICATIONS_PER_MODEL", "0"))
+CACHE_FILE = "swappa_cache.json"
 
 EXCLUDE_KEYWORDS = [
     "printer", "rtx", "gtx", "geforce", "radeon", "graphics card", 
@@ -36,16 +38,53 @@ TARGET_URLS = [
     {"categoria": "Laptop", "brand": "Asus", "url": "https://swappa.com/buy/b/asus"}
 ]
 
+def cargar_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def guardar_cache(cache_data):
+    try:
+        with open(CACHE_FILE, "w") as f:
+            json.dump(cache_data, f)
+    except Exception as e:
+        print(f"[!] Error guardando cache: {e}", flush=True)
+
+def calcular_hash_producto(producto):
+    # Genera un hash único basado en precio, estado y título
+    cadena = f"{producto['cost_price']}_{producto['status']}_{producto['title']}"
+    return hashlib.md5(cadena.encode('utf-8')).hexdigest()
+
 def enviar_producto_a_base44(producto):
     headers = {"Content-Type": "application/json", "x-api-key": SCRAPER_API_KEY}
     try:
         res = requests.post(BASE44_WEBHOOK_URL, json=producto, headers=headers, timeout=15)
         if res.status_code == 200:
-            print(f"      [-> BASE44 OK 200] Guardado: {producto['title']} (${producto['cost_price']})", flush=True)
+            print(f"      [-> BASE44 OK 200] Actualizado/Creado: {producto['title']} (${producto['cost_price']})", flush=True)
+            return True
         else:
             print(f"      [-> BASE44 ERR {res.status_code}] {res.text[:100]}", flush=True)
+            return False
     except Exception as e:
         print(f"      [!] Error enviando a Base44: {e}", flush=True)
+        return False
+
+def enviar_reconciliacion_final(lista_ids_activos):
+    headers = {"Content-Type": "application/json", "x-api-key": SCRAPER_API_KEY}
+    payload = {
+        "action": "reconcile_active_ids",
+        "active_swappa_ids": lista_ids_activos
+    }
+    try:
+        print(f"\n[PURGA FINAL] Enviando lista de {len(lista_ids_activos)} IDs activos a Base44 para depurar obsoletos...", flush=True)
+        res = requests.post(BASE44_WEBHOOK_URL, json=payload, headers=headers, timeout=60)
+        print(f"[BASE44 RES] Estatus: {res.status_code} | Respuesta: {res.text[:200]}", flush=True)
+    except Exception as e:
+        print(f"[!] Error enviando reconciliación final a Base44: {e}", flush=True)
 
 async def extraer_detalles_json_ld(context, listing_url):
     datos_producto = {
@@ -169,15 +208,18 @@ async def extraer_detalles_json_ld(context, listing_url):
         
     return datos_producto
 
-async def procesar_y_enviar_producto(context, surl, categoria, brand, contador):
+async def procesar_producto_con_filtro(context, surl, categoria, brand, contador, cache, ids_activos):
     try:
         detalles = await extraer_detalles_json_ld(context, surl)
         if not detalles["is_available"] or detalles["cost_price"] <= 0:
-            return False
+            return
 
         title_text = detalles["title"] or f"{brand} {categoria}"
         if any(k in title_text.lower() for k in EXCLUDE_KEYWORDS):
-            return False
+            return
+
+        swappa_id = detalles["swappa_id"] or surl.split("/")[-1]
+        ids_activos.append(swappa_id)
 
         storage = "N/A"
         match_storage = re.search(r'\b(64|128|256|512|1|2)\s*(GB|TB)\b', title_text, re.I)
@@ -188,7 +230,7 @@ async def procesar_y_enviar_producto(context, surl, categoria, brand, contador):
         main_image = galeria[0] if galeria else detalles["catalog_image"]
 
         p_obj = {
-            "swappa_id": detalles["swappa_id"] or surl.split("/")[-1],
+            "swappa_id": swappa_id,
             "title": title_text,
             "brand": brand,
             "category": categoria,
@@ -204,15 +246,27 @@ async def procesar_y_enviar_producto(context, surl, categoria, brand, contador):
             "status": "Available"
         }
 
-        print(f"  [+] #{contador} Extraído [{categoria}] {title_text}", flush=True)
-        enviar_producto_a_base44(p_obj)
-        return True
+        # Comprobar si hubo cambios respecto al escaneo anterior
+        hash_actual = calcular_hash_producto(p_obj)
+        hash_previo = cache.get(swappa_id)
+
+        if hash_previo == hash_actual:
+            # Producto idéntico: Se omite la llamada API a Base44
+            print(f"  [=] #{contador} Sin cambios ({swappa_id}): {title_text}", flush=True)
+        else:
+            # Producto nuevo o modificado: Se envía a Base44
+            print(f"  [+] #{contador} CAMBIO DETECTADO -> Enviando [{categoria}] {title_text}", flush=True)
+            exito = enviar_producto_a_base44(p_obj)
+            if exito:
+                cache[swappa_id] = hash_actual
+
     except Exception as e:
         print(f"      [!] Error procesando objeto {surl}: {e}", flush=True)
-        return False
 
 async def ejecutar_extraccion_diaria():
-    print("Iniciando escaneo masivo de Swappa con envío en tiempo real hacia Base44...", flush=True)
+    print("Iniciando escaneo masivo optimizado con filtro de cambios...", flush=True)
+    cache = cargar_cache()
+    ids_activos = []
     contador_total = 0
 
     async with async_playwright() as p:
@@ -258,7 +312,7 @@ async def ejecutar_extraccion_diaria():
                 for source_url in found_urls:
                     if "/listing/" in source_url and "/buy/" not in source_url:
                         contador_total += 1
-                        await procesar_y_enviar_producto(context, source_url, categoria, brand, contador_total)
+                        await procesar_producto_con_filtro(context, source_url, categoria, brand, contador_total, cache, ids_activos)
                     else:
                         try:
                             model_page = await context.new_page()
@@ -280,7 +334,7 @@ async def ejecutar_extraccion_diaria():
 
                             for surl in sub_urls_to_process:
                                 contador_total += 1
-                                await procesar_y_enviar_producto(context, surl, categoria, brand, contador_total)
+                                await procesar_producto_con_filtro(context, surl, categoria, brand, contador_total, cache, ids_activos)
 
                             await model_page.close()
                         except Exception:
@@ -290,8 +344,16 @@ async def ejecutar_extraccion_diaria():
                 print(f"Error procesando sección {target_url}: {nav_error}", flush=True)
 
         await browser.close()
+        
+        # Guardar caché local actualizada
+        guardar_cache(cache)
+
+        # Reconciliación final con Base44 (Depurar ausentes sin saturar)
+        if ids_activos:
+            enviar_reconciliacion_final(ids_activos)
+
         print(f"\n=======================================================", flush=True)
-        print(f" Escaneo completado. Total de productos enviados a Base44: {contador_total}", flush=True)
+        print(f" Escaneo completado. Total de productos evaluados: {contador_total}", flush=True)
         print(f"=======================================================", flush=True)
 
 async def esperar_hasta_10_30_pm():
