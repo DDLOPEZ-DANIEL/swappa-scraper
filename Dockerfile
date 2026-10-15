@@ -1,4 +1,3 @@
-
 FROM mcr.microsoft.com/playwright/python:v1.64.0-jammy
 
 WORKDIR /app
