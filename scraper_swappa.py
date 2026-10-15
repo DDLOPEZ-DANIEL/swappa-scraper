@@ -55,14 +55,14 @@ def guardar_cache(cache_data):
         print(f"[!] Error guardando cache: {e}", flush=True)
 
 def calcular_hash_producto(producto):
-    # Genera un hash único basado en precio, estado y título
-    cadena = f"{producto['cost_price']}_{producto['status']}_{producto['title']}"
+    # Hash basado en precio, estado, título y descripción completa (para detectar cambios en notas o anexos)
+    cadena = f"{producto['cost_price']}_{producto['status']}_{producto['title']}_{producto['description']}"
     return hashlib.md5(cadena.encode('utf-8')).hexdigest()
 
 def enviar_producto_a_base44(producto):
     headers = {"Content-Type": "application/json", "x-api-key": SCRAPER_API_KEY}
     try:
-        res = requests.post(BASE44_WEBHOOK_URL, json=producto, headers=headers, timeout=15)
+        res = requests.post(BASE44_WEBHOOK_URL, json=producto, headers=headers, timeout=20)
         if res.status_code == 200:
             print(f"      [-> BASE44 OK 200] Actualizado/Creado: {producto['title']} (${producto['cost_price']})", flush=True)
             return True
@@ -148,23 +148,27 @@ async def extraer_detalles_json_ld(context, listing_url):
                 continue
 
         desc_parts = []
+
+        # 1. Atributos / Especificaciones Técnicas
         attr_elements = soup.select(".attrs .attr, .listing-attrs .attr, .specs .spec, .tech-specs .spec")
         if attr_elements:
             attrs_text = " - ".join([a.get_text(strip=True) for a in attr_elements if a.get_text(strip=True)])
             if attrs_text:
                 desc_parts.append(f"Atributos / Especificaciones: {attrs_text}")
 
-        headline_elem = soup.select_one("#section_headline, .headline, #seller_notes, .listing-description, #listing_description, .seller-notes")
+        # 2. Notas del vendedor
+        headline_elem = soup.select_one("#section_headline, .headline, #seller_notes, .listing-description, #listing_description, .seller-notes, .description-body")
         if headline_elem:
             text_hl = headline_elem.get_text(separator=" ", strip=True)
-            if text_hl and text_hl not in desc_parts:
+            if text_hl and text_hl not in " ".join(desc_parts):
                 desc_parts.append(f"Notas del vendedor: {text_hl}")
 
-        damage_elem = soup.select_one("#seller_damage_description, .damage-description, #section_description, .condition-notes")
+        # 3. Anexo del listado / Detalles adicionales
+        damage_elem = soup.select_one("#seller_damage_description, .damage-description, #section_description, .condition-notes, .seller-disclosure, .listing-annex")
         if damage_elem:
             text_dmg = damage_elem.get_text(separator=" ", strip=True)
-            if text_dmg and text_dmg not in desc_parts:
-                desc_parts.append(f"Detalles adicionales: {text_dmg}")
+            if text_dmg and text_dmg not in " ".join(desc_parts):
+                desc_parts.append(f"Anexo del listado: {text_dmg}")
 
         if not desc_parts:
             meta_desc = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
@@ -246,16 +250,13 @@ async def procesar_producto_con_filtro(context, surl, categoria, brand, contador
             "status": "Available"
         }
 
-        # Comprobar si hubo cambios respecto al escaneo anterior
         hash_actual = calcular_hash_producto(p_obj)
         hash_previo = cache.get(swappa_id)
 
         if hash_previo == hash_actual:
-            # Producto idéntico: Se omite la llamada API a Base44
             print(f"  [=] #{contador} Sin cambios ({swappa_id}): {title_text}", flush=True)
         else:
-            # Producto nuevo o modificado: Se envía a Base44
-            print(f"  [+] #{contador} CAMBIO DETECTADO -> Enviando [{categoria}] {title_text}", flush=True)
+            print(f"  [+] #{contador} CAMBIO / NUEVO DETECTADO -> Enviando [{categoria}] {title_text}", flush=True)
             exito = enviar_producto_a_base44(p_obj)
             if exito:
                 cache[swappa_id] = hash_actual
@@ -264,7 +265,7 @@ async def procesar_producto_con_filtro(context, surl, categoria, brand, contador
         print(f"      [!] Error procesando objeto {surl}: {e}", flush=True)
 
 async def ejecutar_extraccion_diaria():
-    print("Iniciando escaneo masivo optimizado con filtro de cambios...", flush=True)
+    print("Iniciando escaneo masivo optimizado con descripciones completas...", flush=True)
     cache = cargar_cache()
     ids_activos = []
     contador_total = 0
@@ -344,11 +345,8 @@ async def ejecutar_extraccion_diaria():
                 print(f"Error procesando sección {target_url}: {nav_error}", flush=True)
 
         await browser.close()
-        
-        # Guardar caché local actualizada
         guardar_cache(cache)
 
-        # Reconciliación final con Base44 (Depurar ausentes sin saturar)
         if ids_activos:
             enviar_reconciliacion_final(ids_activos)
 
