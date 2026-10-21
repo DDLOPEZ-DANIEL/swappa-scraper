@@ -3,14 +3,12 @@ import os
 import re
 import json
 import sys
-import hashlib
 import requests
 from datetime import datetime, timedelta
 import zoneinfo
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
-# Forzar salida en vivo en la consola de Railway
 sys.stdout.reconfigure(line_buffering=True)
 
 BASE44_WEBHOOK_URL = os.getenv(
@@ -18,9 +16,8 @@ BASE44_WEBHOOK_URL = os.getenv(
     "https://rebit-ad09a6b3.base44.app/functions/swappaWebhook"
 )
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "mi_clave1_secreta_swappa_2026")
-
 MAX_PUBLICATIONS_PER_MODEL = int(os.getenv("MAX_PUBLICATIONS_PER_MODEL", "0"))
-CACHE_FILE = "swappa_cache.json"
+BATCH_SIZE = 500
 
 EXCLUDE_KEYWORDS = [
     "printer", "rtx", "gtx", "geforce", "radeon", "graphics card", 
@@ -38,54 +35,6 @@ TARGET_URLS = [
     {"categoria": "Laptop", "brand": "Asus", "url": "https://swappa.com/buy/b/asus"}
 ]
 
-def cargar_cache():
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def guardar_cache(cache_data):
-    try:
-        with open(CACHE_FILE, "w") as f:
-            json.dump(cache_data, f)
-    except Exception as e:
-        print(f"[!] Error guardando cache: {e}", flush=True)
-
-def calcular_hash_producto(producto):
-    # Hash basado en precio, estado, título y descripción completa (para detectar cambios en notas o anexos)
-    cadena = f"{producto['cost_price']}_{producto['status']}_{producto['title']}_{producto['description']}"
-    return hashlib.md5(cadena.encode('utf-8')).hexdigest()
-
-def enviar_producto_a_base44(producto):
-    headers = {"Content-Type": "application/json", "x-api-key": SCRAPER_API_KEY}
-    try:
-        res = requests.post(BASE44_WEBHOOK_URL, json=producto, headers=headers, timeout=20)
-        if res.status_code == 200:
-            print(f"      [-> BASE44 OK 200] Actualizado/Creado: {producto['title']} (${producto['cost_price']})", flush=True)
-            return True
-        else:
-            print(f"      [-> BASE44 ERR {res.status_code}] {res.text[:100]}", flush=True)
-            return False
-    except Exception as e:
-        print(f"      [!] Error enviando a Base44: {e}", flush=True)
-        return False
-
-def enviar_reconciliacion_final(lista_ids_activos):
-    headers = {"Content-Type": "application/json", "x-api-key": SCRAPER_API_KEY}
-    payload = {
-        "action": "reconcile_active_ids",
-        "active_swappa_ids": lista_ids_activos
-    }
-    try:
-        print(f"\n[PURGA FINAL] Enviando lista de {len(lista_ids_activos)} IDs activos a Base44 para depurar obsoletos...", flush=True)
-        res = requests.post(BASE44_WEBHOOK_URL, json=payload, headers=headers, timeout=60)
-        print(f"[BASE44 RES] Estatus: {res.status_code} | Respuesta: {res.text[:200]}", flush=True)
-    except Exception as e:
-        print(f"[!] Error enviando reconciliación final a Base44: {e}", flush=True)
-
 async def extraer_detalles_json_ld(context, listing_url):
     datos_producto = {
         "swappa_id": "",
@@ -98,7 +47,6 @@ async def extraer_detalles_json_ld(context, listing_url):
         "gallery_images": [],
         "is_available": True
     }
-    
     try:
         detail_page = await context.new_page()
         await detail_page.goto(listing_url, wait_until="domcontentloaded", timeout=30000)
@@ -138,8 +86,6 @@ async def extraer_detalles_json_ld(context, listing_url):
                         if isinstance(offers, dict):
                             datos_producto["cost_price"] = float(offers.get("price", 0.0))
                             datos_producto["seller"] = offers.get("seller", {}).get("name", "")
-                            if offers.get("availability", "").endswith("OutOfStock") or offers.get("availability", "").endswith("SoldOut"):
-                                datos_producto["is_available"] = False
                         elif isinstance(offers, list) and len(offers) > 0:
                             datos_producto["cost_price"] = float(offers[0].get("price", 0.0))
                             datos_producto["seller"] = offers[0].get("seller", {}).get("name", "")
@@ -148,22 +94,18 @@ async def extraer_detalles_json_ld(context, listing_url):
                 continue
 
         desc_parts = []
-
-        # 1. Atributos / Especificaciones Técnicas
         attr_elements = soup.select(".attrs .attr, .listing-attrs .attr, .specs .spec, .tech-specs .spec")
         if attr_elements:
             attrs_text = " - ".join([a.get_text(strip=True) for a in attr_elements if a.get_text(strip=True)])
             if attrs_text:
                 desc_parts.append(f"Atributos / Especificaciones: {attrs_text}")
 
-        # 2. Notas del vendedor
         headline_elem = soup.select_one("#section_headline, .headline, #seller_notes, .listing-description, #listing_description, .seller-notes, .description-body")
         if headline_elem:
             text_hl = headline_elem.get_text(separator=" ", strip=True)
             if text_hl and text_hl not in " ".join(desc_parts):
                 desc_parts.append(f"Notas del vendedor: {text_hl}")
 
-        # 3. Anexo del listado / Detalles adicionales
         damage_elem = soup.select_one("#seller_damage_description, .damage-description, #section_description, .condition-notes, .seller-disclosure, .listing-annex")
         if damage_elem:
             text_dmg = damage_elem.get_text(separator=" ", strip=True)
@@ -197,33 +139,21 @@ async def extraer_detalles_json_ld(context, listing_url):
             if '/media/listing/' in href and href not in images:
                 images.append(href)
 
-        if not images:
-            for img in soup.find_all('img'):
-                src = img.get('src') or img.get('data-src') or ''
-                if src.startswith('//'):
-                    src = 'https:' + src
-                if '/media/listing/' in src and src not in images:
-                    images.append(src)
-
         datos_producto["gallery_images"] = images
         await detail_page.close()
     except Exception as e:
         print(f"      [!] Error leyendo detalle en {listing_url}: {e}", flush=True)
-        
     return datos_producto
 
-async def procesar_producto_con_filtro(context, surl, categoria, brand, contador, cache, ids_activos):
+async def extraer_producto_objeto(context, surl, categoria, brand):
     try:
         detalles = await extraer_detalles_json_ld(context, surl)
         if not detalles["is_available"] or detalles["cost_price"] <= 0:
-            return
+            return None
 
         title_text = detalles["title"] or f"{brand} {categoria}"
         if any(k in title_text.lower() for k in EXCLUDE_KEYWORDS):
-            return
-
-        swappa_id = detalles["swappa_id"] or surl.split("/")[-1]
-        ids_activos.append(swappa_id)
+            return None
 
         storage = "N/A"
         match_storage = re.search(r'\b(64|128|256|512|1|2)\s*(GB|TB)\b', title_text, re.I)
@@ -233,8 +163,8 @@ async def procesar_producto_con_filtro(context, surl, categoria, brand, contador
         galeria = detalles["gallery_images"]
         main_image = galeria[0] if galeria else detalles["catalog_image"]
 
-        p_obj = {
-            "swappa_id": swappa_id,
+        return {
+            "swappa_id": detalles["swappa_id"] or surl.split("/")[-1],
             "title": title_text,
             "brand": brand,
             "category": categoria,
@@ -249,26 +179,23 @@ async def procesar_producto_con_filtro(context, surl, categoria, brand, contador
             "source_url": surl,
             "status": "Available"
         }
-
-        hash_actual = calcular_hash_producto(p_obj)
-        hash_previo = cache.get(swappa_id)
-
-        if hash_previo == hash_actual:
-            print(f"  [=] #{contador} Sin cambios ({swappa_id}): {title_text}", flush=True)
-        else:
-            print(f"  [+] #{contador} CAMBIO / NUEVO DETECTADO -> Enviando [{categoria}] {title_text}", flush=True)
-            exito = enviar_producto_a_base44(p_obj)
-            if exito:
-                cache[swappa_id] = hash_actual
-
     except Exception as e:
         print(f"      [!] Error procesando objeto {surl}: {e}", flush=True)
+        return None
+
+def enviar_lote_a_base44(lote_productos):
+    headers = {"Content-Type": "application/json", "x-api-key": SCRAPER_API_KEY}
+    payload = {"products": lote_productos}
+    try:
+        res = requests.post(BASE44_WEBHOOK_URL, json=payload, headers=headers, timeout=120)
+        print(f"   [BASE44 RES] Estatus: {res.status_code} | Respuesta: {res.text[:200]}", flush=True)
+    except Exception as e:
+        print(f"   [!] Error enviando lote a Base44: {e}", flush=True)
 
 async def ejecutar_extraccion_diaria():
-    print("Iniciando escaneo masivo optimizado con descripciones completas...", flush=True)
-    cache = cargar_cache()
-    ids_activos = []
-    contador_total = 0
+    print("Iniciando escaneo masivo completo con deduplicación por URL...", flush=True)
+    seen_urls = set()
+    productos_recolectados = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -311,9 +238,15 @@ async def ejecutar_extraccion_diaria():
                                 found_urls.append(full_url)
 
                 for source_url in found_urls:
+                    if source_url in seen_urls:
+                        continue
+                    
                     if "/listing/" in source_url and "/buy/" not in source_url:
-                        contador_total += 1
-                        await procesar_producto_con_filtro(context, source_url, categoria, brand, contador_total, cache, ids_activos)
+                        seen_urls.add(source_url)
+                        p_obj = await extraer_producto_objeto(context, source_url, categoria, brand)
+                        if p_obj:
+                            productos_recolectados.append(p_obj)
+                            print(f"  [+] #{len(productos_recolectados)} [{categoria}] {p_obj['title']} | ${p_obj['cost_price']}", flush=True)
                     else:
                         try:
                             model_page = await context.new_page()
@@ -334,8 +267,13 @@ async def ejecutar_extraccion_diaria():
                             sub_urls_to_process = sub_urls if MAX_PUBLICATIONS_PER_MODEL <= 0 else sub_urls[:MAX_PUBLICATIONS_PER_MODEL]
 
                             for surl in sub_urls_to_process:
-                                contador_total += 1
-                                await procesar_producto_con_filtro(context, surl, categoria, brand, contador_total, cache, ids_activos)
+                                if surl in seen_urls:
+                                    continue
+                                seen_urls.add(surl)
+                                p_obj = await extraer_producto_objeto(context, surl, categoria, brand)
+                                if p_obj:
+                                    productos_recolectados.append(p_obj)
+                                    print(f"  [+] #{len(productos_recolectados)} [{categoria}] {p_obj['title']} | ${p_obj['cost_price']}", flush=True)
 
                             await model_page.close()
                         except Exception:
@@ -345,14 +283,19 @@ async def ejecutar_extraccion_diaria():
                 print(f"Error procesando sección {target_url}: {nav_error}", flush=True)
 
         await browser.close()
-        guardar_cache(cache)
 
-        if ids_activos:
-            enviar_reconciliacion_final(ids_activos)
-
+        total = len(productos_recolectados)
         print(f"\n=======================================================", flush=True)
-        print(f" Escaneo completado. Total de productos evaluados: {contador_total}", flush=True)
+        print(f" Escaneo completado. Total de productos extraídos (únicos): {total}", flush=True)
+        print(f" Enviando lotes consolidados a Base44...", flush=True)
         print(f"=======================================================", flush=True)
+
+        if total > 0:
+            for i in range(0, total, BATCH_SIZE):
+                lote = productos_recolectados[i:i + BATCH_SIZE]
+                print(f" Enviando sub-lote {i//BATCH_SIZE + 1} ({len(lote)} productos)...", flush=True)
+                enviar_lote_a_base44(lote)
+                await asyncio.sleep(2)
 
 async def esperar_hasta_10_30_pm():
     tz_nicaragua = zoneinfo.ZoneInfo("America/Managua")
