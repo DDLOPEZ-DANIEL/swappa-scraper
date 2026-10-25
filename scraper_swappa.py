@@ -193,7 +193,7 @@ def enviar_lote_a_base44(lote_productos):
         print(f"   [!] Error enviando lote a Base44: {e}", flush=True)
 
 async def ejecutar_extraccion_diaria():
-    print("Iniciando escaneo masivo completo con deduplicación por URL...", flush=True)
+    print("Iniciando escaneo masivo completo con deduplicación por URL y por ID...", flush=True)
     seen_urls = set()
     productos_recolectados = []
 
@@ -284,15 +284,24 @@ async def ejecutar_extraccion_diaria():
 
         await browser.close()
 
-        total = len(productos_recolectados)
+        total_bruto = len(productos_recolectados)
         print(f"\n=======================================================", flush=True)
-        print(f" Escaneo completado. Total de productos extraídos (únicos): {total}", flush=True)
+        print(f" Escaneo completado. Total bruto extraído: {total_bruto}", flush=True)
+
+        # Filtrar duplicados por swappa_id para evitar error 500 en Base44
+        unicos_por_id = {}
+        for p in productos_recolectados:
+            unicos_por_id[p["swappa_id"]] = p
+        
+        productos_limpios = list(unicos_por_id.values())
+        total_limpio = len(productos_limpios)
+        print(f" Total de productos únicos por swappa_id: {total_limpio}", flush=True)
         print(f" Enviando lotes consolidados a Base44...", flush=True)
         print(f"=======================================================", flush=True)
 
-        if total > 0:
-            for i in range(0, total, BATCH_SIZE):
-                lote = productos_recolectados[i:i + BATCH_SIZE]
+        if total_limpio > 0:
+            for i in range(0, total_limpio, BATCH_SIZE):
+                lote = productos_limpios[i:i + BATCH_SIZE]
                 print(f" Enviando sub-lote {i//BATCH_SIZE + 1} ({len(lote)} productos)...", flush=True)
                 enviar_lote_a_base44(lote)
                 await asyncio.sleep(2)
